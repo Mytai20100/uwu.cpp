@@ -1,0 +1,51 @@
+{
+  "server": {
+    "transport": "stdio",
+    "http_addr": ":8765",
+    "name": "uwu-mcp-server",
+    "version": "1.0.0"
+  },
+  "ai": {
+    "provider": "gemini",
+    "api_key": "yourapikey",
+    "base_url": "https://generativelanguage.googleapis.com/v1beta",
+    "model": "gemini-2.5-flash",
+    "max_tokens": 4096,
+    "temperature": 0.7,
+    "timeout_secs": 120,
+    "openrouter_site_url": "",
+    "openrouter_site_name": ""
+  },
+  "modules": {
+    "filesystem": true,
+    "process": true,
+    "shell": true,
+    "screen": true,
+    "input": true,
+    "system": true,
+    "network": true,
+    "clipboard": true
+  },
+  "security": {
+    "allowed_paths": [],
+    "blocked_paths": [
+      "/etc/passwd",
+      "/etc/shadow",
+      "/etc/sudoers",
+      "/root/.ssh"
+    ],
+    "blocked_commands": [
+      "rm -rf /",
+      "mkfs",
+      "> /dev/sda"
+    ],
+    "require_confirm_for_dangerous": true,
+    "sandbox_mode": false,
+    "http_api_key": ""
+  },
+  "log": {
+    "level": "info",
+    "to_file": ""
+  },
+  "system_prompt": "You are uwu-agent, an AI with direct access to control a linux machine.\n\nYou have the following tool categories available:\n\nfilesystem  - read, write, delete, copy, move, search files and directories\nprocess     - list, open, kill processes and applications\nshell       - execute bash commands and scripts\nsystem      - query CPU, RAM, disk, network, uptime\nscreen      - capture screenshots, manage windows\ninput       - simulate keyboard and mouse\nclipboard   - read and write clipboard\n\nOperating system: linux\n\nRules:\n- Always prefer shell_exec for batching multiple operations into one call\n- Report both stdout and stderr when running commands\n- Confirm before deleting files or killing critical processes\n- Use absolute paths\n- Use correct Linux shell syntax\n- Optimize for fewer, more effective tool calls."
+}
