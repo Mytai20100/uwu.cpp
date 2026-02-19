@@ -1291,7 +1291,7 @@ textarea:disabled{opacity:.4;cursor:not-allowed}
 </div>
 
 <script>
-// ── state ─────────────────────────────────────────────────────────────────────
+// state 
 let busy = false;
 let attachedFiles = [];
 let sessionFiles = [];
@@ -1303,7 +1303,7 @@ let tokenBudget = 80000;
 const CONV_KEY = 'uwu_conversations';
 const CONV_MAX = 50;
 
-// ── utils ─────────────────────────────────────────────────────────────────────
+// utils
 function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;') }
 function nowStr(){ return new Date().toTimeString().slice(0,8) }
 function genId(){ return Date.now().toString(36)+Math.random().toString(36).slice(2,6) }
@@ -1461,7 +1461,7 @@ function renderConvList(){
   });
 }
 
-// ── token bar ─────────────────────────────────────────────────────────────────
+// token bar
 function updateTokenBar(show){
   const bar=document.getElementById('tokenBar');
   if(!show){ bar.classList.add('hidden'); return; }
@@ -1483,7 +1483,7 @@ function updateTokenBar(show){
   }
 }
 
-// ── ping ──────────────────────────────────────────────────────────────────────
+// ping 
 async function ping(){
   document.getElementById('pingDot').className='dot pinging';
   try{
@@ -1551,7 +1551,7 @@ function providerDefault(p){
          openrouter:'anthropic/claude-sonnet-4-5',ollama:'llama3.3'}[p]||'';
 }
 
-// ── settings ──────────────────────────────────────────────────────────────────
+// settings
 document.getElementById('settingsBtn').addEventListener('click',()=>{
   const p=document.getElementById('settingsPanel');
   const open=!p.classList.contains('open');
@@ -1612,7 +1612,7 @@ function renderToolsList(names){
   });
 }
 
-// ── activity ──────────────────────────────────────────────────────────────────
+// activity 
 document.getElementById('actToggleBtn').addEventListener('click',()=>{
   const aside=document.getElementById('aside');
   const collapsed=aside.classList.toggle('collapsed');
@@ -1637,7 +1637,7 @@ function addAct(type,label,text,meta){
   list.scrollTop=list.scrollHeight;
 }
 
-// ── files ─────────────────────────────────────────────────────────────────────
+// files 
 document.getElementById('filesBtn').addEventListener('click',openFileModal);
 document.getElementById('closeModal').addEventListener('click',()=>document.getElementById('fileModal').classList.remove('open'));
 document.getElementById('fileModal').addEventListener('click',e=>{if(e.target===document.getElementById('fileModal'))document.getElementById('fileModal').classList.remove('open');});
@@ -1692,13 +1692,13 @@ box.addEventListener('dragover',e=>{e.preventDefault();box.style.borderColor='#0
 box.addEventListener('dragleave',()=>{box.style.borderColor=''});
 box.addEventListener('drop',e=>{e.preventDefault();box.style.borderColor='';for(const f of e.dataTransfer.files)addAttach(f)});
 
-// ── new chat ──────────────────────────────────────────────────────────────────
+// new chat 
 document.getElementById('newChatBtn').addEventListener('click',()=>{
   if(busy)return;
   createNewConversation();
 });
 
-// ── send ──────────────────────────────────────────────────────────────────────
+// send 
 async function send(){
   if(busy)return;
   const prompt=box.value.trim();
@@ -1854,7 +1854,7 @@ box.addEventListener('input',function(){this.style.height='auto';this.style.heig
 box.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send();}});
 document.getElementById('sendBtn').addEventListener('click',send);
 
-// ── init ──────────────────────────────────────────────────────────────────────
+// init 
 loadConversations();
 loadModels();
 box.focus();

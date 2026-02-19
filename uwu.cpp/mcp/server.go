@@ -1,5 +1,3 @@
-// Package mcp implements a Model Context Protocol server.
-// Supports stdio transport (for Claude Desktop) and HTTP transport.
 package mcp
 
 import (
@@ -17,7 +15,7 @@ import (
 	"uwu.cpp/uwu"
 )
 
-// ─── JSON-RPC 2.0 ────────────────────────────────────────────────────────────
+// JSON-RPC 2.0 
 
 type Request struct {
 	JSONRPC string          `json:"jsonrpc"`
@@ -39,7 +37,7 @@ type RPCError struct {
 	Data    interface{} `json:"data,omitempty"`
 }
 
-// ─── MCP TYPES ────────────────────────────────────────────────────────────────
+// MCP TYPES
 
 type InitializeResult struct {
 	ProtocolVersion string     `json:"protocolVersion"`
@@ -98,7 +96,7 @@ type PromptMessage struct {
 	Content map[string]interface{} `json:"content"`
 }
 
-// ─── SERVER ───────────────────────────────────────────────────────────────────
+// SERVER
 
 type Server struct {
 	cfg      *config.Config
@@ -152,7 +150,7 @@ func (s *Server) ServeHTTP(addr string) error {
 	return http.ListenAndServe(addr, mux)
 }
 
-// ─── DISPATCH ─────────────────────────────────────────────────────────────────
+// DISPATCH 
 
 func (s *Server) dispatch(req *Request) {
 	var (
@@ -267,7 +265,7 @@ func (s *Server) handleCallTool(req *Request) (interface{}, *RPCError) {
 	return &CallToolResult{Content: content, IsError: result.IsError}, nil
 }
 
-// ─── HTTP HANDLERS ────────────────────────────────────────────────────────────
+// HTTP HANDLERS 
 
 func (s *Server) httpHandler(w http.ResponseWriter, r *http.Request) {
 	if !s.auth(r) {
@@ -384,8 +382,7 @@ td,th{padding:6px 10px;border-bottom:1px solid #333;text-align:left}th{color:#88
 </body></html>`, s.cfg.Server.Version, s.cfg.AI.Provider, s.cfg.AI.Model, len(tools), rows)
 }
 
-// ─── HELPERS ──────────────────────────────────────────────────────────────────
-
+// HELPERS
 func (s *Server) send(resp *Response) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

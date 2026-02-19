@@ -81,7 +81,7 @@ func (c *Client) Complete(req CompletionRequest) (*CompletionResponse, error) {
 	}
 }
 
-// ─── ANTHROPIC ───────────────────────────────────────────────────────────────
+// ANTHROPIC 
 
 type anthropicRequest struct {
 	Model       string             `json:"model"`
@@ -283,7 +283,7 @@ func (c *Client) openAIComplete(req CompletionRequest, endpoint string) (*Comple
 	}, nil
 }
 
-// ─── GEMINI ───────────────────────────────────────────────────────────────────
+// GEMINI 
 
 type geminiRequest struct {
 	Contents         []geminiContent        `json:"contents"`
