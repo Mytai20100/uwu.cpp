@@ -9,76 +9,228 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
-// flags
-
 var (
-	mcpAddr      = flag.String("mcp", "http://localhost:8765", "MCP server address")
-	listenAddr   = flag.String("addr", ":9000", "Web UI listen address")
-	mcpAPIKey    = flag.String("key", "", "MCP HTTP API key")
-	apiKey       = flag.String("api-key", "", "AI provider API key")
-	provider     = flag.String("provider", "gemini", "Provider: gemini|anthropic|openai|openrouter|ollama|custom")
-	defaultModel = flag.String("model", "", "Default model (empty = provider default)")
-	baseURL      = flag.String("base-url", "", "Custom base URL (ollama/custom)")
-	toolModules  = flag.String("modules", "shell,filesystem,system,process,clipboard,screen,input", "MCP modules. Never include 'ai'")
-	maxTools     = flag.Int("max-tools", 40, "Max tools per request")
-	maxTurns     = flag.Int("max-turns", 12, "Max agentic turns per request (lower = fewer API calls)")
-	tokenBudget  = flag.Int("token-budget", 80000, "Max input tokens across all turns (0=unlimited)")
+	mcpAddr       = flag.String("mcp", "http://localhost:8765", "MCP server address")
+	listenAddr    = flag.String("addr", ":9000", "Web UI listen address")
+	mcpAPIKey     = flag.String("key", "", "MCP HTTP API key")
+	apiKey        = flag.String("api-key", "", "AI provider API key")
+	provider      = flag.String("provider", "gemini", "Provider: gemini|anthropic|openai|openrouter|ollama|custom")
+	defaultModel  = flag.String("model", "", "Default model (empty = provider default)")
+	baseURL       = flag.String("base-url", "", "Custom base URL (ollama/custom)")
+	toolModules   = flag.String("modules", "shell,filesystem,system,process,clipboard,screen,input", "MCP modules. Never include 'ai'")
+	maxTools      = flag.Int("max-tools", 40, "Max tools per request")
+	maxTurns      = flag.Int("max-turns", 12, "Max agentic turns per request (lower = fewer API calls)")
+	tokenBudget   = flag.Int("token-budget", 80000, "Max input tokens across all turns (0=unlimited)")
 	minIntervalMs = flag.Int("min-interval", 1500, "Min ms between AI requests (rate limit)")
-	resultTrunc  = flag.Int("result-trunc", 600, "Max chars for tool result in context")
+	resultTrunc   = flag.Int("result-trunc", 600, "Max chars for tool result in context")
+	configFile    = flag.String("config", "config.yml", "Path to config YAML file")
 )
 
-// active config
+const defaultSystemPrompt = "You are uwu-agent. Use MCP tools to execute tasks on this Linux machine. Be concise and efficient."
 
 var (
-	activeMu       sync.RWMutex
-	activeProvider string
-	activeModel    string
-	activeAPIKey   string
-	activeBaseURL  string
-	activeMaxTurns int
-	activeTokenBudget int
+	activeMu           sync.RWMutex
+	activeProvider     string
+	activeModel        string
+	activeAPIKey       string
+	activeBaseURL      string
+	activeMaxTurns     int
+	activeTokenBudget  int
+	activeToolsEnabled bool
+	activeSystemPrompt string
 )
+
+// ── config.yml load/save ──────────────────────────────────────────────────
+
+type configYAML struct {
+	Provider     string
+	Model        string
+	APIKey       string
+	BaseURL      string
+	MaxTurns     int
+	TokenBudget  int
+	ToolsEnabled bool
+	SystemPrompt string
+}
+
+func loadConfigFile() {
+	data, err := os.ReadFile(*configFile)
+	if err != nil {
+		return // file not found is fine
+	}
+	cfg := parseSimpleYAML(string(data))
+	activeMu.Lock()
+	defer activeMu.Unlock()
+	if v, ok := cfg["provider"]; ok && v != "" {
+		activeProvider = v
+	}
+	if v, ok := cfg["model"]; ok && v != "" {
+		activeModel = v
+	}
+	if v, ok := cfg["api_key"]; ok {
+		activeAPIKey = v
+	}
+	if v, ok := cfg["base_url"]; ok {
+		activeBaseURL = v
+	}
+	if v, ok := cfg["max_turns"]; ok {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			activeMaxTurns = n
+		}
+	}
+	if v, ok := cfg["token_budget"]; ok {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			activeTokenBudget = n
+		}
+	}
+	if v, ok := cfg["tools_enabled"]; ok {
+		activeToolsEnabled = v == "true"
+	}
+	if v, ok := cfg["system_prompt"]; ok && v != "" {
+		activeSystemPrompt = v
+	}
+	log.Printf("[config] loaded from %s", *configFile)
+}
+
+func saveConfigFile() {
+	activeMu.RLock()
+	prov := activeProvider
+	model := activeModel
+	key := activeAPIKey
+	base := activeBaseURL
+	turns := activeMaxTurns
+	budget := activeTokenBudget
+	toolsOn := activeToolsEnabled
+	sysPrompt := activeSystemPrompt
+	activeMu.RUnlock()
+
+	// encode system_prompt as a quoted YAML string to handle multiline safely
+	sysPromptQ := yamlQuoteString(sysPrompt)
+
+	content := fmt.Sprintf("# uwu-agent config — auto-generated\n"+
+		"provider: %s\n"+
+		"model: %s\n"+
+		"api_key: %s\n"+
+		"base_url: %s\n"+
+		"max_turns: %d\n"+
+		"token_budget: %d\n"+
+		"tools_enabled: %v\n"+
+		"system_prompt: %s\n",
+		prov, model,
+		yamlQuoteString(key),
+		yamlQuoteString(base),
+		turns, budget, toolsOn,
+		sysPromptQ,
+	)
+	if err := os.WriteFile(*configFile, []byte(content), 0644); err != nil {
+		log.Printf("[config] save error: %v", err)
+	} else {
+		log.Printf("[config] saved to %s", *configFile)
+	}
+}
+
+// yamlQuoteString wraps a value in double-quotes with basic escaping.
+func yamlQuoteString(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `"`, `\"`)
+	s = strings.ReplaceAll(s, "\n", `\n`)
+	s = strings.ReplaceAll(s, "\r", `\r`)
+	return `"` + s + `"`
+}
+
+// parseSimpleYAML parses flat key: "value" or key: value lines.
+func parseSimpleYAML(content string) map[string]string {
+	out := map[string]string{}
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		idx := strings.Index(line, ":")
+		if idx < 0 {
+			continue
+		}
+		k := strings.TrimSpace(line[:idx])
+		v := strings.TrimSpace(line[idx+1:])
+		// handle quoted strings
+		if len(v) >= 2 && v[0] == '"' && v[len(v)-1] == '"' {
+			v = v[1 : len(v)-1]
+			v = strings.ReplaceAll(v, `\"`, `"`)
+			v = strings.ReplaceAll(v, `\\`, `\`)
+			v = strings.ReplaceAll(v, `\n`, "\n")
+			v = strings.ReplaceAll(v, `\r`, "\r")
+		}
+		out[k] = v
+	}
+	return out
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 
 func initActive() {
 	activeMu.Lock()
-	defer activeMu.Unlock()
 	activeProvider = *provider
 	activeAPIKey = *apiKey
 	activeBaseURL = *baseURL
 	activeModel = *defaultModel
 	activeMaxTurns = *maxTurns
 	activeTokenBudget = *tokenBudget
+	activeToolsEnabled = true
+	activeSystemPrompt = defaultSystemPrompt
 	if activeModel == "" {
 		activeModel = providerDefaultModel(activeProvider)
 	}
+	activeMu.Unlock()
+
+	// overlay with saved config (may overwrite flag defaults)
+	loadConfigFile()
+}
+
+func getSystemPrompt() string {
+	activeMu.RLock()
+	defer activeMu.RUnlock()
+	if activeSystemPrompt == "" {
+		return defaultSystemPrompt
+	}
+	return activeSystemPrompt
 }
 
 func providerDefaultModel(p string) string {
 	switch p {
-	case "anthropic":  return "claude-sonnet-4-5"
-	case "openai":     return "gpt-4o"
-	case "openrouter": return "anthropic/claude-sonnet-4-5"
-	case "ollama":     return "llama3.3"
-	case "gemini":     return "gemini-2.0-flash"
-	default:           return ""
+	case "anthropic":
+		return "claude-sonnet-4-5"
+	case "openai":
+		return "gpt-4o"
+	case "openrouter":
+		return "anthropic/claude-sonnet-4-5"
+	case "ollama":
+		return "llama3.3"
+	case "gemini":
+		return "gemini-2.0-flash"
+	default:
+		return ""
 	}
 }
 
 func providerBaseURL(p string) string {
 	switch p {
-	case "openai":     return "https://api.openai.com/v1"
-	case "openrouter": return "https://openrouter.ai/api/v1"
-	case "ollama":     return "http://localhost:11434/v1"
-	default:           return ""
+	case "openai":
+		return "https://api.openai.com/v1"
+	case "openrouter":
+		return "https://openrouter.ai/api/v1"
+	case "ollama":
+		return "http://localhost:11434/v1"
+	default:
+		return ""
 	}
 }
-
-// global rate limiter
 
 var (
 	rateMu      sync.Mutex
@@ -95,8 +247,6 @@ func waitRateLimit() {
 	}
 	lastReqTime = time.Now()
 }
-
-// cached tools
 
 var (
 	cachedTools   []mcpTool
@@ -121,8 +271,6 @@ func getTools() []mcpTool {
 	defer cachedToolsMu.RUnlock()
 	return cachedTools
 }
-
-// MCP
 
 type mcpRPCReq struct {
 	JSONRPC string      `json:"jsonrpc"`
@@ -184,7 +332,7 @@ func filterTools(tools []mcpTool) []mcpTool {
 	for _, m := range strings.Split(*toolModules, ",") {
 		m = strings.TrimSpace(strings.ToLower(m))
 		if m == "ai" {
-			log.Println("[warn] 'ai' module BLOCKED — would cause recursive billing")
+			log.Println("[warn] 'ai' module BLOCKED")
 			continue
 		}
 		allowed[m] = true
@@ -192,7 +340,6 @@ func filterTools(tools []mcpTool) []mcpTool {
 	var out []mcpTool
 	for _, t := range tools {
 		mod := strings.SplitN(t.Name, "_", 2)[0]
-		// Hard-block ai tools regardless of module list
 		if mod == "ai" {
 			log.Printf("[tools] blocked ai tool: %s", t.Name)
 			continue
@@ -213,7 +360,7 @@ func callMCPTool(name string, args map[string]interface{}) (string, bool) {
 		return "error: " + err.Error(), true
 	}
 	var out struct {
-		Result mcpToolResult           `json:"result"`
+		Result mcpToolResult
 		Error  *struct{ Message string } `json:"error"`
 	}
 	if err := json.Unmarshal(raw, &out); err != nil {
@@ -235,10 +382,8 @@ func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
 	}
-	return s[:n] + "…"
+	return s[:n] + "..."
 }
-
-// uploaded file cache
 
 type uploadedFile struct {
 	Name     string
@@ -251,8 +396,6 @@ var (
 	uploadedFiles []uploadedFile
 )
 
-// GEMINI
-
 type geminiContent struct {
 	Role  string       `json:"role,omitempty"`
 	Parts []geminiPart `json:"parts"`
@@ -263,15 +406,28 @@ type geminiPart struct {
 	FunctionCall     *geminiFuncCall     `json:"functionCall,omitempty"`
 	FunctionResponse *geminiFuncResponse `json:"functionResponse,omitempty"`
 }
-type geminiInlineData   struct{ MimeType string `json:"mimeType"`; Data string `json:"data"` }
-type geminiFuncCall     struct{ Name string `json:"name"`; Args map[string]interface{} `json:"args"` }
-type geminiFuncResponse struct{ Name string `json:"name"`; Response map[string]interface{} `json:"response"` }
+type geminiInlineData struct {
+	MimeType string `json:"mimeType"`
+	Data     string `json:"data"`
+}
+type geminiFuncCall struct {
+	Name string                 `json:"name"`
+	Args map[string]interface{} `json:"args"`
+}
+type geminiFuncResponse struct {
+	Name     string                 `json:"name"`
+	Response map[string]interface{} `json:"response"`
+}
 
 func sanitizeSchema(s map[string]interface{}) map[string]interface{} {
-	if s == nil { return nil }
+	if s == nil {
+		return nil
+	}
 	out := map[string]interface{}{}
 	for k, v := range s {
-		if k == "$schema" || k == "additionalProperties" || k == "$defs" || k == "$ref" { continue }
+		if k == "$schema" || k == "additionalProperties" || k == "$defs" || k == "$ref" {
+			continue
+		}
 		if sub, ok := v.(map[string]interface{}); ok {
 			out[k] = sanitizeSchema(sub)
 		} else {
@@ -285,52 +441,76 @@ func geminiToolDefs(tools []mcpTool) []interface{} {
 	decls := make([]interface{}, 0, len(tools))
 	for _, t := range tools {
 		d := map[string]interface{}{"name": t.Name, "description": t.Description}
-		if t.InputSchema != nil { d["parameters"] = sanitizeSchema(t.InputSchema) }
+		if t.InputSchema != nil {
+			d["parameters"] = sanitizeSchema(t.InputSchema)
+		}
 		decls = append(decls, d)
 	}
 	return []interface{}{map[string]interface{}{"functionDeclarations": decls}}
 }
 
-func runGeminiAgent(model string, tools []mcpTool, parts []geminiPart, turns int, budget int, emit func(string, interface{})) {
+func runGeminiAgent(model string, tools []mcpTool, toolsEnabled bool, parts []geminiPart, turns int, budget int, emit func(string, interface{})) {
 	key := activeAPIKey
+	sysPrompt := getSystemPrompt()
 	contents := []geminiContent{{Role: "user", Parts: parts}}
-	gdefs := geminiToolDefs(tools)
 	totalIn, totalOut := 0, 0
+
+	var gdefs []interface{}
+	if toolsEnabled && len(tools) > 0 {
+		gdefs = geminiToolDefs(tools)
+	}
 
 	for turn := 0; turn < turns; turn++ {
 		waitRateLimit()
-		emit("activity", map[string]string{"text": "◌ thinking…", "ts": now()})
+		emit("activity", map[string]string{"text": "thinking...", "ts": now()})
 
 		body := map[string]interface{}{
 			"contents": contents,
 			"systemInstruction": map[string]interface{}{
-				"parts": []map[string]string{{"text": "You are uwu-agent. Use MCP tools to execute tasks on this Linux machine. Be concise and efficient — avoid redundant tool calls."}},
+				"parts": []map[string]string{{"text": sysPrompt}},
 			},
-			"tools":            gdefs,
 			"generationConfig": map[string]interface{}{"maxOutputTokens": 4096, "temperature": 0.7},
 		}
+		if len(gdefs) > 0 {
+			body["tools"] = gdefs
+		}
+
 		data, _ := json.Marshal(body)
 		url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent?key=%s", model, key)
 		resp, err := doPost(url, "", data)
-		if err != nil { emit("error", err.Error()); return }
+		if err != nil {
+			emit("error", err.Error())
+			return
+		}
 
 		var gr struct {
 			Candidates []struct {
 				Content      geminiContent `json:"content"`
 				FinishReason string        `json:"finishReason"`
 			} `json:"candidates"`
-			UsageMetadata struct{ PromptTokenCount, CandidatesTokenCount int } `json:"usageMetadata"`
-			Error         *struct{ Status, Message string }                    `json:"error"`
+			UsageMetadata struct {
+				PromptTokenCount     int
+				CandidatesTokenCount int
+			} `json:"usageMetadata"`
+			Error *struct{ Status, Message string } `json:"error"`
 		}
-		if err := json.Unmarshal(resp, &gr); err != nil { emit("error", "parse: "+truncate(string(resp), 150)); return }
-		if gr.Error != nil { emit("error", fmt.Sprintf("gemini [%s]: %s", gr.Error.Status, gr.Error.Message)); return }
-		if len(gr.Candidates) == 0 { emit("error", "no candidates"); return }
+		if err := json.Unmarshal(resp, &gr); err != nil {
+			emit("error", "parse: "+truncate(string(resp), 150))
+			return
+		}
+		if gr.Error != nil {
+			emit("error", fmt.Sprintf("gemini [%s]: %s", gr.Error.Status, gr.Error.Message))
+			return
+		}
+		if len(gr.Candidates) == 0 {
+			emit("error", "no candidates")
+			return
+		}
 
 		totalIn += gr.UsageMetadata.PromptTokenCount
 		totalOut += gr.UsageMetadata.CandidatesTokenCount
 		emit("tokens", map[string]int{"in": totalIn, "out": totalOut, "turn": turn + 1})
 
-		// Token budget check
 		if budget > 0 && totalIn > budget {
 			emit("error", fmt.Sprintf("token budget exceeded (%d > %d input tokens)", totalIn, budget))
 			return
@@ -342,17 +522,23 @@ func runGeminiAgent(model string, tools []mcpTool, parts []geminiPart, turns int
 		var funcCalls []geminiFuncCall
 		var texts []string
 		for _, p := range cand.Content.Parts {
-			if p.FunctionCall != nil { funcCalls = append(funcCalls, *p.FunctionCall) }
-			if p.Text != "" { texts = append(texts, p.Text) }
+			if p.FunctionCall != nil {
+				funcCalls = append(funcCalls, *p.FunctionCall)
+			}
+			if p.Text != "" {
+				texts = append(texts, p.Text)
+			}
 		}
 
 		if len(funcCalls) == 0 {
-			emit("activity", map[string]interface{}{"text": fmt.Sprintf("← done  in:%d out:%d tok  (%d turns)", totalIn, totalOut, turn+1), "ts": now()})
+			emit("activity", map[string]interface{}{"text": fmt.Sprintf("done  in:%d out:%d tok  (%d turns)", totalIn, totalOut, turn+1), "ts": now()})
 			emit("reply", strings.Join(texts, "\n"))
 			emit("done", nil)
 			return
 		}
-		if len(texts) > 0 { emit("thinking", strings.Join(texts, "\n")) }
+		if len(texts) > 0 {
+			emit("thinking", strings.Join(texts, "\n"))
+		}
 
 		var frs []geminiPart
 		for _, fc := range funcCalls {
@@ -362,7 +548,6 @@ func runGeminiAgent(model string, tools []mcpTool, parts []geminiPart, turns int
 			result, isErr := callMCPTool(fc.Name, fc.Args)
 			ms := time.Since(start).Milliseconds()
 			emit("tool_result", map[string]interface{}{"name": fc.Name, "result": truncate(result, 300), "ms": ms, "ts": now(), "err": isErr})
-			// Truncate result sent back to AI to save tokens
 			truncResult := truncate(result, *resultTrunc)
 			frs = append(frs, geminiPart{FunctionResponse: &geminiFuncResponse{Name: fc.Name, Response: map[string]interface{}{"result": truncResult}}})
 		}
@@ -370,8 +555,6 @@ func runGeminiAgent(model string, tools []mcpTool, parts []geminiPart, turns int
 	}
 	emit("error", fmt.Sprintf("max turns (%d) reached", turns))
 }
-
-// ANTHROPIC
 
 func anthropicToolDefs(tools []mcpTool) []interface{} {
 	out := make([]interface{}, 0, len(tools))
@@ -387,26 +570,39 @@ func anthropicToolDefs(tools []mcpTool) []interface{} {
 	return out
 }
 
-func runAnthropicAgent(model string, tools []mcpTool, promptParts []interface{}, turns int, budget int, emit func(string, interface{})) {
+func runAnthropicAgent(model string, tools []mcpTool, toolsEnabled bool, promptParts []interface{}, turns int, budget int, emit func(string, interface{})) {
 	key := activeAPIKey
+	sysPrompt := getSystemPrompt()
 	messages := []map[string]interface{}{{"role": "user", "content": promptParts}}
-	defs := anthropicToolDefs(tools)
 	totalIn, totalOut := 0, 0
+
+	var defs []interface{}
+	if toolsEnabled && len(tools) > 0 {
+		defs = anthropicToolDefs(tools)
+	}
 
 	for turn := 0; turn < turns; turn++ {
 		waitRateLimit()
-		emit("activity", map[string]string{"text": "◌ thinking…", "ts": now()})
+		emit("activity", map[string]string{"text": "thinking...", "ts": now()})
 
 		body := map[string]interface{}{
-			"model": model, "max_tokens": 4096,
-			"system": "You are uwu-agent. Use MCP tools to execute tasks on this Linux machine. Be concise and efficient — avoid redundant tool calls.",
-			"tools": defs, "messages": messages,
+			"model":      model,
+			"max_tokens": 4096,
+			"system":     sysPrompt,
+			"messages":   messages,
 		}
+		if len(defs) > 0 {
+			body["tools"] = defs
+		}
+
 		data, _ := json.Marshal(body)
 		resp, err := doPostHeaders("https://api.anthropic.com/v1/messages", map[string]string{
 			"x-api-key": key, "anthropic-version": "2023-06-01",
 		}, data)
-		if err != nil { emit("error", err.Error()); return }
+		if err != nil {
+			emit("error", err.Error())
+			return
+		}
 
 		var ar struct {
 			Content []struct {
@@ -417,11 +613,20 @@ func runAnthropicAgent(model string, tools []mcpTool, promptParts []interface{},
 				Input map[string]interface{} `json:"input"`
 			} `json:"content"`
 			StopReason string `json:"stop_reason"`
-			Usage      struct{ InputTokens, OutputTokens int } `json:"usage"`
+			Usage      struct {
+				InputTokens  int
+				OutputTokens int
+			} `json:"usage"`
 			Error *struct{ Type, Message string } `json:"error"`
 		}
-		if err := json.Unmarshal(resp, &ar); err != nil { emit("error", "parse: "+truncate(string(resp), 150)); return }
-		if ar.Error != nil { emit("error", fmt.Sprintf("anthropic [%s]: %s", ar.Error.Type, ar.Error.Message)); return }
+		if err := json.Unmarshal(resp, &ar); err != nil {
+			emit("error", "parse: "+truncate(string(resp), 150))
+			return
+		}
+		if ar.Error != nil {
+			emit("error", fmt.Sprintf("anthropic [%s]: %s", ar.Error.Type, ar.Error.Message))
+			return
+		}
 
 		totalIn += ar.Usage.InputTokens
 		totalOut += ar.Usage.OutputTokens
@@ -434,20 +639,34 @@ func runAnthropicAgent(model string, tools []mcpTool, promptParts []interface{},
 
 		messages = append(messages, map[string]interface{}{"role": "assistant", "content": ar.Content})
 
-		var toolUses []struct{ ID, Name string; Input map[string]interface{} }
+		var toolUses []struct {
+			ID    string
+			Name  string
+			Input map[string]interface{}
+		}
 		var texts []string
 		for _, c := range ar.Content {
-			if c.Type == "text" && c.Text != "" { texts = append(texts, c.Text) }
-			if c.Type == "tool_use" { toolUses = append(toolUses, struct{ ID, Name string; Input map[string]interface{} }{c.ID, c.Name, c.Input}) }
+			if c.Type == "text" && c.Text != "" {
+				texts = append(texts, c.Text)
+			}
+			if c.Type == "tool_use" {
+				toolUses = append(toolUses, struct {
+					ID    string
+					Name  string
+					Input map[string]interface{}
+				}{c.ID, c.Name, c.Input})
+			}
 		}
 
 		if len(toolUses) == 0 {
-			emit("activity", map[string]interface{}{"text": fmt.Sprintf("← done  in:%d out:%d tok  (%d turns)", totalIn, totalOut, turn+1), "ts": now()})
+			emit("activity", map[string]interface{}{"text": fmt.Sprintf("done  in:%d out:%d tok  (%d turns)", totalIn, totalOut, turn+1), "ts": now()})
 			emit("reply", strings.Join(texts, "\n"))
 			emit("done", nil)
 			return
 		}
-		if len(texts) > 0 { emit("thinking", strings.Join(texts, "\n")) }
+		if len(texts) > 0 {
+			emit("thinking", strings.Join(texts, "\n"))
+		}
 
 		var toolResults []interface{}
 		for _, tu := range toolUses {
@@ -467,13 +686,13 @@ func runAnthropicAgent(model string, tools []mcpTool, promptParts []interface{},
 	emit("error", fmt.Sprintf("max turns (%d) reached", turns))
 }
 
-// OPENAI-compatible
-
 func openAIToolDefs(tools []mcpTool) []interface{} {
 	out := make([]interface{}, 0, len(tools))
 	for _, t := range tools {
 		params := map[string]interface{}{"type": "object", "properties": map[string]interface{}{}}
-		if t.InputSchema != nil { params = t.InputSchema }
+		if t.InputSchema != nil {
+			params = t.InputSchema
+		}
 		out = append(out, map[string]interface{}{
 			"type": "function",
 			"function": map[string]interface{}{
@@ -484,22 +703,28 @@ func openAIToolDefs(tools []mcpTool) []interface{} {
 	return out
 }
 
-func runOpenAIAgent(prov, model string, tools []mcpTool, promptParts []interface{}, turns int, budget int, emit func(string, interface{})) {
+func runOpenAIAgent(prov, model string, tools []mcpTool, toolsEnabled bool, promptParts []interface{}, turns int, budget int, emit func(string, interface{})) {
 	key := activeAPIKey
+	sysPrompt := getSystemPrompt()
 	base := activeBaseURL
-	if base == "" { base = providerBaseURL(prov) }
-	// For ollama: if base has no /v1 path, add it (Ollama OpenAI-compat lives at /v1)
+	if base == "" {
+		base = providerBaseURL(prov)
+	}
 	if prov == "ollama" && !strings.Contains(base, "/v1") {
 		base = strings.TrimSuffix(base, "/") + "/v1"
 	}
 	endpoint := base + "/chat/completions"
 
 	messages := []map[string]interface{}{
-		{"role": "system", "content": "You are uwu-agent. Use MCP tools to execute tasks on this Linux machine. Be concise and efficient — avoid redundant tool calls."},
+		{"role": "system", "content": sysPrompt},
 		{"role": "user", "content": promptParts},
 	}
-	defs := openAIToolDefs(tools)
 	totalIn, totalOut := 0, 0
+
+	var defs []interface{}
+	if toolsEnabled && len(tools) > 0 {
+		defs = openAIToolDefs(tools)
+	}
 
 	headers := map[string]string{"Authorization": "Bearer " + key}
 	if prov == "openrouter" {
@@ -509,14 +734,23 @@ func runOpenAIAgent(prov, model string, tools []mcpTool, promptParts []interface
 
 	for turn := 0; turn < turns; turn++ {
 		waitRateLimit()
-		emit("activity", map[string]string{"text": "◌ thinking…", "ts": now()})
+		emit("activity", map[string]string{"text": "thinking...", "ts": now()})
 
 		body := map[string]interface{}{
-			"model": model, "messages": messages, "tools": defs, "tool_choice": "auto",
+			"model":    model,
+			"messages": messages,
 		}
+		if len(defs) > 0 {
+			body["tools"] = defs
+			body["tool_choice"] = "auto"
+		}
+
 		data, _ := json.Marshal(body)
 		resp, err := doPostHeaders(endpoint, headers, data)
-		if err != nil { emit("error", err.Error()); return }
+		if err != nil {
+			emit("error", err.Error())
+			return
+		}
 
 		var or struct {
 			Choices []struct {
@@ -532,12 +766,24 @@ func runOpenAIAgent(prov, model string, tools []mcpTool, promptParts []interface
 					} `json:"tool_calls"`
 				} `json:"message"`
 			} `json:"choices"`
-			Usage struct{ PromptTokens, CompletionTokens int } `json:"usage"`
+			Usage struct {
+				PromptTokens     int
+				CompletionTokens int
+			} `json:"usage"`
 			Error *struct{ Message, Type string } `json:"error"`
 		}
-		if err := json.Unmarshal(resp, &or); err != nil { emit("error", "parse: "+truncate(string(resp), 150)); return }
-		if or.Error != nil { emit("error", fmt.Sprintf("[%s]: %s", or.Error.Type, or.Error.Message)); return }
-		if len(or.Choices) == 0 { emit("error", "no choices"); return }
+		if err := json.Unmarshal(resp, &or); err != nil {
+			emit("error", "parse: "+truncate(string(resp), 150))
+			return
+		}
+		if or.Error != nil {
+			emit("error", fmt.Sprintf("[%s]: %s", or.Error.Type, or.Error.Message))
+			return
+		}
+		if len(or.Choices) == 0 {
+			emit("error", "no choices")
+			return
+		}
 
 		totalIn += or.Usage.PromptTokens
 		totalOut += or.Usage.CompletionTokens
@@ -554,12 +800,14 @@ func runOpenAIAgent(prov, model string, tools []mcpTool, promptParts []interface
 		})
 
 		if len(msg.ToolCalls) == 0 {
-			emit("activity", map[string]interface{}{"text": fmt.Sprintf("← done  in:%d out:%d tok  (%d turns)", totalIn, totalOut, turn+1), "ts": now()})
+			emit("activity", map[string]interface{}{"text": fmt.Sprintf("done  in:%d out:%d tok  (%d turns)", totalIn, totalOut, turn+1), "ts": now()})
 			emit("reply", msg.Content)
 			emit("done", nil)
 			return
 		}
-		if msg.Content != "" { emit("thinking", msg.Content) }
+		if msg.Content != "" {
+			emit("thinking", msg.Content)
+		}
 
 		for _, tc := range msg.ToolCalls {
 			var args map[string]interface{}
@@ -578,29 +826,33 @@ func runOpenAIAgent(prov, model string, tools []mcpTool, promptParts []interface
 	emit("error", fmt.Sprintf("max turns (%d) reached", turns))
 }
 
-// HTTP helpers 
-
 func doPost(url, bearerKey string, data []byte) ([]byte, error) {
 	h := map[string]string{}
-	if bearerKey != "" { h["Authorization"] = "Bearer " + bearerKey }
+	if bearerKey != "" {
+		h["Authorization"] = "Bearer " + bearerKey
+	}
 	return doPostHeaders(url, h, data)
 }
 
 func doPostHeaders(url string, headers map[string]string, data []byte) ([]byte, error) {
 	req, err := http.NewRequest("POST", url, bytes.NewReader(data))
-	if err != nil { return nil, err }
+	if err != nil {
+		return nil, err
+	}
 	req.Header.Set("Content-Type", "application/json")
-	for k, v := range headers { req.Header.Set(k, v) }
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
 	client := &http.Client{Timeout: 120 * time.Second}
 	resp, err := client.Do(req)
-	if err != nil { return nil, err }
+	if err != nil {
+		return nil, err
+	}
 	defer resp.Body.Close()
 	return io.ReadAll(resp.Body)
 }
 
 func now() string { return time.Now().Format("15:04:05") }
-
-// handlers 
 
 func pingHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
@@ -608,11 +860,16 @@ func pingHandler(w http.ResponseWriter, r *http.Request) {
 	resp, err := http.Get(*mcpAddr + "/health")
 	ms := time.Since(start).Milliseconds()
 	activeMu.RLock()
-	prov, model, turns, budget := activeProvider, activeModel, activeMaxTurns, activeTokenBudget
+	prov, model, turns, budget, toolsEnabled, sysPrompt := activeProvider, activeModel, activeMaxTurns, activeTokenBudget, activeToolsEnabled, activeSystemPrompt
 	activeMu.RUnlock()
 	info := map[string]interface{}{
-		"provider": prov, "model": model, "tools": len(getTools()),
-		"max_turns": turns, "token_budget": budget,
+		"provider":      prov,
+		"model":         model,
+		"tools":         len(getTools()),
+		"max_turns":     turns,
+		"token_budget":  budget,
+		"tools_enabled": toolsEnabled,
+		"system_prompt": sysPrompt,
 	}
 	if err != nil {
 		json.NewEncoder(w).Encode(map[string]interface{}{"ok": false, "ms": -1, "info": info})
@@ -638,7 +895,10 @@ func modelsHandler(w http.ResponseWriter, r *http.Request) {
 	case "gemini":
 		url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models?key=%s&pageSize=50", key)
 		resp, err := http.Get(url)
-		if err != nil { json.NewEncoder(w).Encode(map[string]interface{}{"error": err.Error()}); return }
+		if err != nil {
+			json.NewEncoder(w).Encode(map[string]interface{}{"error": err.Error()})
+			return
+		}
 		defer resp.Body.Close()
 		var raw struct {
 			Models []struct {
@@ -677,7 +937,9 @@ func modelsHandler(w http.ResponseWriter, r *http.Request) {
 		ep := "https://openrouter.ai/api/v1/models"
 		if resp, err := http.Get(ep); err == nil {
 			defer resp.Body.Close()
-			var raw struct{ Data []struct{ ID, Name string } `json:"data"` }
+			var raw struct {
+				Data []struct{ ID, Name string } `json:"data"`
+			}
 			body, _ := io.ReadAll(resp.Body)
 			json.Unmarshal(body, &raw)
 			for _, m := range raw.Data {
@@ -696,13 +958,16 @@ func modelsHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 	case "ollama":
-		// ollamaRoot strips /v1 — /api/tags lives at root, not under /v1
 		ollamaRoot := base
-		if ollamaRoot == "" { ollamaRoot = "http://localhost:11434" }
+		if ollamaRoot == "" {
+			ollamaRoot = "http://localhost:11434"
+		}
 		ollamaRoot = strings.TrimSuffix(strings.TrimSuffix(ollamaRoot, "/"), "/v1")
 		if resp, err := http.Get(ollamaRoot + "/api/tags"); err == nil {
 			defer resp.Body.Close()
-			var raw struct{ Models []struct{ Name string } `json:"models"` }
+			var raw struct {
+				Models []struct{ Name string } `json:"models"`
+			}
 			body, _ := io.ReadAll(resp.Body)
 			json.Unmarshal(body, &raw)
 			for _, m := range raw.Models {
@@ -724,29 +989,64 @@ func modelsHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func configHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" { http.Error(w, "POST only", 405); return }
+	if r.Method != "POST" {
+		http.Error(w, "POST only", 405)
+		return
+	}
 	var body struct {
-		Provider    string `json:"provider"`
-		Model       string `json:"model"`
-		APIKey      string `json:"api_key"`
-		BaseURL     string `json:"base_url"`
-		MaxTurns    int    `json:"max_turns"`
-		TokenBudget int    `json:"token_budget"`
+		Provider     string `json:"provider"`
+		Model        string `json:"model"`
+		APIKey       string `json:"api_key"`
+		BaseURL      string `json:"base_url"`
+		MaxTurns     int    `json:"max_turns"`
+		TokenBudget  int    `json:"token_budget"`
+		ToolsEnabled *bool  `json:"tools_enabled"`
+		SystemPrompt *string `json:"system_prompt"`
 	}
 	json.NewDecoder(r.Body).Decode(&body)
 	activeMu.Lock()
-	if body.Provider != "" { activeProvider = body.Provider }
-	if body.Model != ""    { activeModel = body.Model }
-	if body.APIKey != ""   { activeAPIKey = body.APIKey }
-	if body.BaseURL != ""  { activeBaseURL = body.BaseURL }
-	if body.MaxTurns > 0   { activeMaxTurns = body.MaxTurns }
-	if body.TokenBudget >= 0 { activeTokenBudget = body.TokenBudget }
+	if body.Provider != "" {
+		activeProvider = body.Provider
+	}
+	if body.Model != "" {
+		activeModel = body.Model
+	}
+	if body.APIKey != "" {
+		activeAPIKey = body.APIKey
+	}
+	if body.BaseURL != "" {
+		activeBaseURL = body.BaseURL
+	}
+	if body.MaxTurns > 0 {
+		activeMaxTurns = body.MaxTurns
+	}
+	if body.TokenBudget >= 0 {
+		activeTokenBudget = body.TokenBudget
+	}
+	if body.ToolsEnabled != nil {
+		activeToolsEnabled = *body.ToolsEnabled
+	}
+	if body.SystemPrompt != nil {
+		if *body.SystemPrompt == "" {
+			activeSystemPrompt = defaultSystemPrompt
+		} else {
+			activeSystemPrompt = *body.SystemPrompt
+		}
+	}
 	activeMu.Unlock()
+
+	// persist to config.yml
+	saveConfigFile()
+
 	w.Header().Set("Content-Type", "application/json")
 	activeMu.RLock()
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"provider": activeProvider, "model": activeModel,
-		"max_turns": activeMaxTurns, "token_budget": activeTokenBudget,
+		"provider":      activeProvider,
+		"model":         activeModel,
+		"max_turns":     activeMaxTurns,
+		"token_budget":  activeTokenBudget,
+		"tools_enabled": activeToolsEnabled,
+		"system_prompt": activeSystemPrompt,
 	})
 	activeMu.RUnlock()
 }
@@ -759,7 +1059,9 @@ func refreshToolsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	tools := getTools()
 	names := make([]string, len(tools))
-	for i, t := range tools { names[i] = t.Name }
+	for i, t := range tools {
+		names[i] = t.Name
+	}
 	json.NewEncoder(w).Encode(map[string]interface{}{"tools": len(tools), "names": names})
 }
 
@@ -797,10 +1099,13 @@ func fileDownloadHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func agentHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" { http.Error(w, "POST only", 405); return }
+	if r.Method != "POST" {
+		http.Error(w, "POST only", 405)
+		return
+	}
 	r.ParseMultipartForm(64 << 20)
 
-	prompt        := r.FormValue("prompt")
+	prompt := r.FormValue("prompt")
 	modelOverride := r.FormValue("model")
 	turnsOverride := 0
 	fmt.Sscanf(r.FormValue("max_turns"), "%d", &turnsOverride)
@@ -822,37 +1127,49 @@ func agentHandler(w http.ResponseWriter, r *http.Request) {
 	model := activeModel
 	turns := activeMaxTurns
 	budget := activeTokenBudget
+	toolsEnabled := activeToolsEnabled
 	activeMu.RUnlock()
-	if modelOverride != "" { model = modelOverride }
-	if turnsOverride > 0 { turns = turnsOverride }
-
-	tools := getTools()
-	emit("activity", map[string]interface{}{
-		"text": fmt.Sprintf("✓ %d tools · %s/%s · max %d turns", len(tools), prov, model, turns), "ts": now(),
-	})
-	if budget > 0 {
-		emit("activity", map[string]interface{}{"text": fmt.Sprintf("⚡ token budget: %dk", budget/1000), "ts": now()})
+	if modelOverride != "" {
+		model = modelOverride
+	}
+	if turnsOverride > 0 {
+		turns = turnsOverride
 	}
 
-	// Process uploaded files
-	var geminiParts  []geminiPart
+	tools := getTools()
+	toolsLabel := "on"
+	if !toolsEnabled {
+		toolsLabel = "off"
+	}
+	emit("activity", map[string]interface{}{
+		"text": fmt.Sprintf("%d tools [%s] · %s/%s · max %d turns", len(tools), toolsLabel, prov, model, turns), "ts": now(),
+	})
+	if budget > 0 {
+		emit("activity", map[string]interface{}{"text": fmt.Sprintf("token budget: %dk", budget/1000), "ts": now()})
+	}
+
+	var geminiParts []geminiPart
 	var anthropicParts []interface{}
-	var openaiParts  []interface{}
+	var openaiParts []interface{}
 	newFiles := []uploadedFile{}
 
 	if r.MultipartForm != nil {
 		for _, fhs := range r.MultipartForm.File {
 			for _, fh := range fhs {
 				f, err := fh.Open()
-				if err != nil { continue }
+				if err != nil {
+					continue
+				}
 				data, _ := io.ReadAll(f)
 				f.Close()
 				mime := fh.Header.Get("Content-Type")
-				if mime == "" { mime = "application/octet-stream" }
+				if mime == "" {
+					mime = "application/octet-stream"
+				}
 				b64 := base64.StdEncoding.EncodeToString(data)
 
 				newFiles = append(newFiles, uploadedFile{fh.Filename, mime, data})
-				emit("activity", map[string]string{"text": fmt.Sprintf("📎 %s (%dKB)", fh.Filename, len(data)/1024), "ts": now()})
+				emit("activity", map[string]string{"text": fmt.Sprintf("attach: %s (%dKB)", fh.Filename, len(data)/1024), "ts": now()})
 
 				geminiParts = append(geminiParts, geminiPart{InlineData: &geminiInlineData{MimeType: mime, Data: b64}})
 				if strings.HasPrefix(mime, "image/") {
@@ -860,7 +1177,7 @@ func agentHandler(w http.ResponseWriter, r *http.Request) {
 						"type": "image", "source": map[string]interface{}{"type": "base64", "media_type": mime, "data": b64},
 					})
 					openaiParts = append(openaiParts, map[string]interface{}{
-						"type": "image_url",
+						"type":      "image_url",
 						"image_url": map[string]string{"url": "data:" + mime + ";base64," + b64},
 					})
 				}
@@ -877,27 +1194,25 @@ func agentHandler(w http.ResponseWriter, r *http.Request) {
 	switch prov {
 	case "gemini":
 		parts := append([]geminiPart{{Text: prompt}}, geminiParts...)
-		runGeminiAgent(model, tools, parts, turns, budget, emit)
+		runGeminiAgent(model, tools, toolsEnabled, parts, turns, budget, emit)
 
 	case "anthropic":
 		parts := []interface{}{map[string]string{"type": "text", "text": prompt}}
 		parts = append(parts, anthropicParts...)
-		runAnthropicAgent(model, tools, parts, turns, budget, emit)
+		runAnthropicAgent(model, tools, toolsEnabled, parts, turns, budget, emit)
 
 	default:
 		parts := []interface{}{map[string]string{"type": "text", "text": prompt}}
 		parts = append(parts, openaiParts...)
-		runOpenAIAgent(prov, model, tools, parts, turns, budget, emit)
+		runOpenAIAgent(prov, model, tools, toolsEnabled, parts, turns, budget, emit)
 	}
 }
-
-// main 
 
 func main() {
 	flag.Parse()
 	initActive()
 
-	log.Printf("fetching MCP tools from %s…", *mcpAddr)
+	log.Printf("fetching MCP tools from %s...", *mcpAddr)
 	if err := refreshTools(); err != nil {
 		log.Printf("[warn] tools load failed: %v", err)
 	}
@@ -919,8 +1234,6 @@ func main() {
 	log.Fatal(http.ListenAndServe(*listenAddr, nil))
 }
 
-// HTML GUi
-
 const pageHTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -937,8 +1250,6 @@ const pageHTML = `<!DOCTYPE html>
   --sidebar-w:220px;--act-w:260px;
 }
 html,body{height:100%;background:var(--bg);color:var(--fg);font-family:var(--mono);font-size:13px;overflow:hidden}
-
-/* ── header ── */
 header{display:flex;align-items:center;justify-content:space-between;padding:0 14px 0 10px;height:46px;border-bottom:1px solid var(--border);position:fixed;top:0;left:0;right:0;background:var(--bg);z-index:200}
 .logo{font-size:14px;font-weight:600;letter-spacing:-.02em;padding:0 4px}
 .logo span{color:var(--muted);font-weight:300}
@@ -950,17 +1261,19 @@ select:focus{border-color:#000}
 .ibtn{background:none;border:1px solid var(--border);color:var(--muted);font-family:var(--mono);font-size:11px;padding:3px 8px;cursor:pointer;transition:all .15s;white-space:nowrap}
 .ibtn:hover{border-color:#000;color:#000}
 .ibtn.active{background:#000;color:#fff;border-color:#000}
+.tools-toggle{background:none;border:1px solid var(--border);color:var(--muted);font-family:var(--mono);font-size:11px;padding:3px 8px;cursor:pointer;transition:all .15s;white-space:nowrap;display:flex;align-items:center;gap:5px}
+.tools-toggle:hover{border-color:#000;color:#000}
+.tools-toggle.enabled{border-color:#22c55e;color:#16a34a;background:#f0fdf4}
+.tools-toggle.enabled:hover{border-color:#16a34a;background:#dcfce7}
+.tools-toggle.disabled{border-color:#e0e0e0;color:var(--muted);background:var(--hover)}
+.tools-toggle-dot{width:6px;height:6px;border-radius:50%;background:currentColor;flex-shrink:0}
 .ping-badge{display:flex;align-items:center;gap:5px;font-size:11px;color:var(--muted)}
 .dot{width:6px;height:6px;border-radius:50%;background:var(--muted)}
 .dot.ok{background:#22c55e}.dot.err{background:#ef4444}
 .dot.pinging{animation:pulse .8s ease-in-out infinite}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.2}}
 .ping-ms{font-variant-numeric:tabular-nums;min-width:40px}
-
-/* ── layout ── */
 .layout{display:flex;height:100vh;padding-top:46px}
-
-/* ── conversations sidebar ── */
 .conv-sidebar{width:var(--sidebar-w);flex-shrink:0;border-right:1px solid var(--border);display:flex;flex-direction:column;background:var(--bg);z-index:100}
 .conv-sidebar-hdr{padding:8px 10px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:6px;flex-shrink:0}
 .new-chat-btn{flex:1;background:#000;color:#fff;border:none;font-family:var(--mono);font-size:11px;font-weight:500;padding:6px 10px;cursor:pointer;transition:opacity .15s;text-align:left}
@@ -977,8 +1290,6 @@ select:focus{border-color:#000}
 .conv-item:hover .conv-del{opacity:1}
 .conv-del:hover{color:var(--danger)}
 .conv-empty{padding:16px 12px;font-size:11px;color:var(--muted);line-height:1.6}
-
-/* ── main chat ── */
 .main{flex:1;display:flex;flex-direction:column;overflow:hidden;min-width:0}
 .msgs{flex:1;overflow-y:auto;padding:16px 0}
 .msgs::-webkit-scrollbar{width:4px}
@@ -991,7 +1302,6 @@ select:focus{border-color:#000}
 .msg-body{font-size:13px;line-height:1.75;white-space:pre-wrap;word-break:break-word}
 .msg.user .msg-body{font-weight:500}
 .msg.assistant .msg-body{color:#222}
-/* markdown-ish */
 .msg-body code{font-family:var(--mono);background:#f5f5f5;padding:1px 5px;font-size:12px}
 .msg-body pre{background:#f5f5f5;padding:10px 12px;overflow-x:auto;margin:6px 0;font-size:12px;line-height:1.5}
 .msg-body pre code{background:none;padding:0}
@@ -1008,8 +1318,6 @@ select:focus{border-color:#000}
 .empty-state{flex:1;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:6px;color:var(--muted);padding:40px}
 .empty-state .big{font-size:15px;font-weight:600;color:#000}
 .empty-state .sm{font-size:11px;text-align:center;line-height:1.7;max-width:320px}
-
-/* ── token bar ── */
 .token-bar{display:flex;align-items:center;gap:10px;padding:4px 20px;font-size:10px;color:var(--muted);border-bottom:1px solid var(--border);background:var(--hover);flex-shrink:0;min-height:0;overflow:hidden;transition:all .2s}
 .token-bar.hidden{padding:0 20px;min-height:0;height:0;border:none}
 .tok-val{font-variant-numeric:tabular-nums;color:#000;font-weight:500}
@@ -1017,8 +1325,6 @@ select:focus{border-color:#000}
 .tok-budget-fill{height:100%;background:#000;transition:width .3s}
 .tok-budget-fill.warn{background:#f59e0b}
 .tok-budget-fill.over{background:#ef4444}
-
-/* ── input ── */
 .input-area{border-top:1px solid var(--border);padding:10px 20px;display:flex;flex-direction:column;gap:7px;flex-shrink:0}
 .input-row{display:flex;gap:7px;align-items:flex-end}
 .input-wrap{flex:1}
@@ -1043,8 +1349,6 @@ textarea:disabled{opacity:.4;cursor:not-allowed}
 .prev-chip img{max-height:28px;max-width:50px}
 .prev-chip .rm{cursor:pointer;color:var(--muted);margin-left:2px}
 .prev-chip .rm:hover{color:#000}
-
-/* ── activity sidebar ── */
 .aside{width:var(--act-w);flex-shrink:0;border-left:1px solid var(--border);display:flex;flex-direction:column;overflow:hidden;transition:width .2s}
 .aside.collapsed{width:0;border:none}
 .panel-hdr{padding:8px 12px;font-size:9px;font-weight:600;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;flex-shrink:0;white-space:nowrap}
@@ -1066,20 +1370,21 @@ textarea:disabled{opacity:.4;cursor:not-allowed}
 .spinner{display:none;width:7px;height:7px;border:1.5px solid #ddd;border-top-color:#000;border-radius:50%;animation:spin .5s linear infinite;flex-shrink:0}
 .spinner.on{display:block}
 @keyframes spin{to{transform:rotate(360deg)}}
-
-/* ── settings panel ── */
 .settings-panel{display:none;position:fixed;top:46px;right:0;bottom:0;width:300px;background:#fff;border-left:1px solid var(--border);z-index:150;flex-direction:column;overflow-y:auto}
 .settings-panel.open{display:flex}
 .settings-section{padding:14px 16px;border-bottom:1px solid var(--border)}
 .settings-label{font-size:9px;font-weight:600;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);margin-bottom:9px;display:flex;align-items:center;justify-content:space-between}
 .settings-row{display:flex;flex-direction:column;gap:3px;margin-bottom:9px}
 .settings-row label{font-size:10px;color:var(--muted)}
-.settings-row input,.settings-row select{width:100%;background:transparent;border:1px solid var(--border);color:#000;font-family:var(--mono);font-size:12px;padding:5px 8px;outline:none;transition:border-color .15s}
-.settings-row input:focus,.settings-row select:focus{border-color:#000}
+.settings-row input,.settings-row select,.settings-row textarea{width:100%;background:transparent;border:1px solid var(--border);color:#000;font-family:var(--mono);font-size:12px;padding:5px 8px;outline:none;transition:border-color .15s}
+.settings-row textarea{resize:vertical;min-height:90px;line-height:1.5}
+.settings-row input:focus,.settings-row select:focus,.settings-row textarea:focus{border-color:#000}
 .settings-row select{appearance:none;-webkit-appearance:none;cursor:pointer}
 .settings-row .hint{margin-top:2px}
 .apply-btn{background:#000;color:#fff;border:none;font-family:var(--mono);font-size:11px;padding:7px 14px;cursor:pointer;width:100%;transition:opacity .15s}
 .apply-btn:hover{opacity:.75}
+.reset-link{font-size:10px;color:var(--muted);cursor:pointer;text-decoration:underline;margin-top:4px;display:inline-block}
+.reset-link:hover{color:#000}
 .range-row{display:flex;align-items:center;gap:8px}
 .range-row input[type=range]{flex:1;accent-color:#000;cursor:pointer}
 .range-val{font-size:11px;font-weight:500;min-width:28px;text-align:right}
@@ -1087,8 +1392,14 @@ textarea:disabled{opacity:.4;cursor:not-allowed}
 .mod-chip{font-size:10px;border:1px solid var(--border);padding:3px 8px;cursor:pointer;background:var(--hover);transition:all .15s}
 .mod-chip.on{background:#000;color:#fff;border-color:#000}
 .mod-chip:hover{border-color:#000}
-
-/* ── file modal ── */
+.tools-setting-row{display:flex;align-items:center;justify-content:space-between;margin-bottom:9px}
+.tools-setting-row label{font-size:10px;color:var(--muted)}
+.toggle-switch{position:relative;width:36px;height:20px;cursor:pointer;flex-shrink:0}
+.toggle-switch input{opacity:0;width:0;height:0;position:absolute}
+.toggle-track{position:absolute;inset:0;background:var(--border);border-radius:10px;transition:background .2s}
+.toggle-thumb{position:absolute;top:3px;left:3px;width:14px;height:14px;background:#fff;border-radius:50%;transition:transform .2s;box-shadow:0 1px 3px rgba(0,0,0,.2)}
+.toggle-switch input:checked + .toggle-track{background:#22c55e}
+.toggle-switch input:checked ~ .toggle-thumb{transform:translateX(16px)}
 .modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:1000;align-items:center;justify-content:center}
 .modal-overlay.open{display:flex}
 .modal{background:#fff;width:680px;max-width:95vw;max-height:88vh;display:flex;flex-direction:column;border:1px solid var(--border)}
@@ -1105,11 +1416,11 @@ textarea:disabled{opacity:.4;cursor:not-allowed}
 .dl-btn{background:#000;color:#fff;border:none;font-family:var(--mono);font-size:10px;padding:4px 10px;cursor:pointer;white-space:nowrap}
 .dl-btn:hover{opacity:.75}
 .modal-empty{padding:32px;text-align:center;color:var(--muted);font-size:12px}
-
-/* ── tools panel ── */
 .tools-list{padding:4px 0;max-height:180px;overflow-y:auto}
 .tool-item{padding:3px 10px;font-size:10px;color:var(--muted);display:flex;gap:6px}
 .tool-item::before{content:'▸';flex-shrink:0}
+.save-indicator{font-size:10px;color:#16a34a;margin-left:6px;opacity:0;transition:opacity .3s}
+.save-indicator.show{opacity:1}
 </style>
 </head>
 <body>
@@ -1128,13 +1439,17 @@ textarea:disabled{opacity:.4;cursor:not-allowed}
       </select>
     </div>
     <div class="sel-wrap">
-      <select id="modelSel"><option value="">loading…</option></select>
+      <select id="modelSel"><option value="">loading...</option></select>
     </div>
   </div>
   <div class="hright">
-    <button class="ibtn" id="settingsBtn">⚙ config</button>
-    <button class="ibtn" id="filesBtn">📁 files</button>
-    <button class="ibtn" id="actToggleBtn">◧ activity</button>
+    <button class="tools-toggle enabled" id="toolsToggleBtn" title="Toggle MCP tools on/off">
+      <span class="tools-toggle-dot"></span>
+      <span id="toolsToggleTxt">tools on</span>
+    </button>
+    <button class="ibtn" id="settingsBtn">config</button>
+    <button class="ibtn" id="filesBtn">files</button>
+    <button class="ibtn" id="actToggleBtn">activity</button>
     <div class="ping-badge">
       <div class="dot pinging" id="pingDot"></div>
       <span class="ping-ms" id="pingMs">—</span>
@@ -1143,7 +1458,6 @@ textarea:disabled{opacity:.4;cursor:not-allowed}
 </header>
 
 <div class="layout">
-  <!-- conversations sidebar -->
   <div class="conv-sidebar">
     <div class="conv-sidebar-hdr">
       <button class="new-chat-btn" id="newChatBtn">+ new chat</button>
@@ -1153,7 +1467,6 @@ textarea:disabled{opacity:.4;cursor:not-allowed}
     </div>
   </div>
 
-  <!-- main chat -->
   <div class="main">
     <div class="token-bar hidden" id="tokenBar">
       <span>tokens:</span>
@@ -1175,10 +1488,10 @@ textarea:disabled{opacity:.4;cursor:not-allowed}
       <div class="previews" id="previews"></div>
       <div class="input-row">
         <div class="input-wrap">
-          <textarea id="box" placeholder="ask agent to do something…" rows="1"></textarea>
+          <textarea id="box" placeholder="ask agent to do something..." rows="1"></textarea>
         </div>
         <div class="btn-row">
-          <button class="attach-btn" id="attachBtn" title="Attach file">⊕</button>
+          <button class="attach-btn" id="attachBtn" title="Attach file">+</button>
           <input type="file" id="fileInput" multiple accept="image/*,application/pdf,.txt,.csv,.json,.py,.go,.js,.ts,.md,.sh,.zip">
           <button class="send-btn" id="sendBtn">send</button>
         </div>
@@ -1193,12 +1506,11 @@ textarea:disabled{opacity:.4;cursor:not-allowed}
     </div>
   </div>
 
-  <!-- activity sidebar -->
   <div class="aside" id="aside">
     <div class="panel-hdr">
       <span>activity</span>
       <div class="panel-hdr-btns">
-        <button class="phbtn" id="clearActBtn" title="Clear">✕</button>
+        <button class="phbtn" id="clearActBtn" title="Clear">x</button>
       </div>
     </div>
     <div class="act-list" id="actList"></div>
@@ -1209,7 +1521,6 @@ textarea:disabled{opacity:.4;cursor:not-allowed}
   </div>
 </div>
 
-<!-- settings panel -->
 <div class="settings-panel" id="settingsPanel">
   <div class="settings-section">
     <div class="settings-label">provider config</div>
@@ -1226,24 +1537,37 @@ textarea:disabled{opacity:.4;cursor:not-allowed}
     </div>
     <div class="settings-row">
       <label>api key</label>
-      <input type="password" id="cfgKey" placeholder="sk-… or AIzaSy…">
+      <input type="password" id="cfgKey" placeholder="sk-... or AIzaSy...">
     </div>
     <div class="settings-row">
-      <label>base url <span style="color:var(--muted)">(ollama/custom)</span></label>
+      <label>base url (ollama/custom)</label>
       <input type="text" id="cfgBase" placeholder="http://localhost:11434">
     </div>
     <button class="apply-btn" id="applyConfig">apply provider</button>
   </div>
 
   <div class="settings-section">
-    <div class="settings-label">request limits <span style="font-size:9px;color:var(--muted);font-weight:400">avoid credit waste</span></div>
+    <div class="settings-label">system prompt</div>
+    <div class="settings-row">
+      <label>prompt sent before every conversation</label>
+      <textarea id="cfgSystemPrompt" rows="5" placeholder="You are uwu-agent..."></textarea>
+      <span class="reset-link" id="resetPromptBtn">reset to default</span>
+    </div>
+    <button class="apply-btn" id="applySystemPrompt">
+      save system prompt
+      <span class="save-indicator" id="promptSaveIndicator">✓ saved</span>
+    </button>
+  </div>
+
+  <div class="settings-section">
+    <div class="settings-label">request limits</div>
     <div class="settings-row">
       <label>max turns per request</label>
       <div class="range-row">
         <input type="range" id="cfgMaxTurns" min="1" max="30" value="12">
         <span class="range-val" id="cfgMaxTurnsVal">12</span>
       </div>
-      <span class="hint">lower = fewer API calls, less likely to waste credits</span>
+      <span class="hint">lower = fewer API calls</span>
     </div>
     <div class="settings-row">
       <label>token budget (0 = unlimited)</label>
@@ -1255,6 +1579,14 @@ textarea:disabled{opacity:.4;cursor:not-allowed}
 
   <div class="settings-section">
     <div class="settings-label">tools &amp; modules</div>
+    <div class="tools-setting-row">
+      <label>enable MCP tools</label>
+      <label class="toggle-switch">
+        <input type="checkbox" id="cfgToolsEnabled" checked>
+        <div class="toggle-track"></div>
+        <div class="toggle-thumb"></div>
+      </label>
+    </div>
     <div class="settings-row">
       <label>enabled modules (never includes 'ai')</label>
       <div class="modules-grid" id="modulesGrid">
@@ -1277,12 +1609,11 @@ textarea:disabled{opacity:.4;cursor:not-allowed}
   </div>
 </div>
 
-<!-- file modal -->
 <div class="modal-overlay" id="fileModal">
   <div class="modal">
     <div class="modal-hdr">
       <span class="modal-title">uploaded files</span>
-      <button class="modal-close" id="closeModal">×</button>
+      <button class="modal-close" id="closeModal">x</button>
     </div>
     <div class="modal-body" id="modalBody">
       <div class="modal-empty">no files uploaded yet</div>
@@ -1291,19 +1622,20 @@ textarea:disabled{opacity:.4;cursor:not-allowed}
 </div>
 
 <script>
-// state 
-let busy = false;
-let attachedFiles = [];
-let sessionFiles = [];
-let conversations = [];   // [{id, title, messages:[{role,text,files?}], created}]
-let activeConvId = null;
-let tokenStats = {in:0, out:0, turn:0};
-let tokenBudget = 80000;
+var busy = false;
+var attachedFiles = [];
+var sessionFiles = [];
+var conversations = [];
+var activeConvId = null;
+var tokenStats = {in:0, out:0, turn:0};
+var tokenBudget = 80000;
+var toolsEnabled = true;
+var currentSystemPrompt = 'You are uwu-agent. Use MCP tools to execute tasks on this Linux machine. Be concise and efficient.';
+var DEFAULT_SYSTEM_PROMPT = currentSystemPrompt;
 
-const CONV_KEY = 'uwu_conversations';
-const CONV_MAX = 50;
+var CONV_KEY = 'uwu_conversations';
+var CONV_MAX = 50;
 
-// utils
 function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;') }
 function nowStr(){ return new Date().toTimeString().slice(0,8) }
 function genId(){ return Date.now().toString(36)+Math.random().toString(36).slice(2,6) }
@@ -1313,23 +1645,68 @@ function setStatus(t, loading){
   document.getElementById('spinner').className = 'spinner'+(loading?' on':'');
 }
 
-// basic markdown: bold, inline code, code blocks
-// \x60 = backtick — cannot use literal backtick inside Go raw string
 function renderMd(text){
-  let h = esc(text);
-  // code blocks
-  h = h.replace(/\x60\x60\x60[\w]*\n?([\s\S]*?)\x60\x60\x60/g, (_,c)=>'<pre><code>'+c+'</code></pre>');
-  // inline code
+  var h = esc(text);
+  h = h.replace(/\x60\x60\x60[\w]*\n?([\s\S]*?)\x60\x60\x60/g, function(_,c){return '<pre><code>'+c+'</code></pre>';});
   h = h.replace(/\x60([^\x60]+)\x60/g, '<code>$1</code>');
-  // bold
   h = h.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
   return h;
 }
 
-// ── conversations (localStorage) ─────────────────────────────────────────────
+function updateToolsToggleUI(){
+  var btn = document.getElementById('toolsToggleBtn');
+  var txt = document.getElementById('toolsToggleTxt');
+  var cfgChk = document.getElementById('cfgToolsEnabled');
+  if(toolsEnabled){
+    btn.className = 'tools-toggle enabled';
+    txt.textContent = 'tools on';
+  } else {
+    btn.className = 'tools-toggle disabled';
+    txt.textContent = 'tools off';
+  }
+  cfgChk.checked = toolsEnabled;
+}
+
+async function setToolsEnabled(val){
+  toolsEnabled = val;
+  updateToolsToggleUI();
+  await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({tools_enabled: val})});
+  addAct('activity',null,'tools '+(val?'enabled':'disabled'),{ts:nowStr()});
+}
+
+document.getElementById('toolsToggleBtn').addEventListener('click', function(){
+  setToolsEnabled(!toolsEnabled);
+});
+
+document.getElementById('cfgToolsEnabled').addEventListener('change', function(){
+  setToolsEnabled(this.checked);
+});
+
+// ── System prompt handlers ───────────────────────────────────────────────
+
+document.getElementById('applySystemPrompt').addEventListener('click', async function(){
+  var prompt = document.getElementById('cfgSystemPrompt').value.trim();
+  var resp = await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({system_prompt: prompt})});
+  var d = await resp.json();
+  currentSystemPrompt = d.system_prompt || DEFAULT_SYSTEM_PROMPT;
+  document.getElementById('cfgSystemPrompt').value = currentSystemPrompt;
+  var ind = document.getElementById('promptSaveIndicator');
+  ind.classList.add('show');
+  setTimeout(function(){ ind.classList.remove('show'); }, 2000);
+  addAct('activity',null,'system prompt updated · saved to config.yml',{ts:nowStr()});
+});
+
+document.getElementById('resetPromptBtn').addEventListener('click', function(){
+  document.getElementById('cfgSystemPrompt').value = DEFAULT_SYSTEM_PROMPT;
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+
 function loadConversations(){
   try{
-    const raw = localStorage.getItem(CONV_KEY);
+    var raw = localStorage.getItem(CONV_KEY);
     if(raw) conversations = JSON.parse(raw);
   }catch(e){ conversations = []; }
   renderConvList();
@@ -1339,13 +1716,12 @@ function loadConversations(){
 }
 
 function saveConversations(){
-  // keep latest CONV_MAX
   if(conversations.length > CONV_MAX) conversations = conversations.slice(0, CONV_MAX);
   try{ localStorage.setItem(CONV_KEY, JSON.stringify(conversations)); }catch(e){}
 }
 
 function createNewConversation(){
-  const conv = {id:genId(), title:'New chat', messages:[], created:Date.now()};
+  var conv = {id:genId(), title:'New chat', messages:[], created:Date.now()};
   conversations.unshift(conv);
   saveConversations();
   loadConversation(conv.id);
@@ -1355,13 +1731,12 @@ function createNewConversation(){
 
 function loadConversation(id){
   activeConvId = id;
-  const conv = conversations.find(c=>c.id===id);
+  var conv = conversations.find(function(c){return c.id===id;});
   if(!conv) return;
 
-  // render messages
-  const msgsEl = document.getElementById('msgs');
+  var msgsEl = document.getElementById('msgs');
   msgsEl.innerHTML = '';
-  const emptyEl = document.createElement('div');
+  var emptyEl = document.createElement('div');
   emptyEl.className = 'empty-state';
   emptyEl.id = 'emptyState';
   emptyEl.innerHTML = '<div class="big">uwu agent</div><div class="sm">Multi-provider AI agent with MCP tools.<br>Shell, filesystem, system, process, clipboard &amp; more.</div>';
@@ -1369,11 +1744,11 @@ function loadConversation(id){
   if(conv.messages.length === 0){
     msgsEl.appendChild(emptyEl);
   } else {
-    conv.messages.forEach((m, i)=>{
+    conv.messages.forEach(function(m, i){
       if(i>0 && m.role==='user'){
-        const d=document.createElement('div');d.className='divider';d.innerHTML='<span>· · ·</span>';msgsEl.appendChild(d);
+        var d=document.createElement('div');d.className='divider';d.innerHTML='<span>· · ·</span>';msgsEl.appendChild(d);
       }
-      const el=document.createElement('div');
+      var el=document.createElement('div');
       el.className='msg '+(m.role==='user'?'user':'assistant');
       el.innerHTML='<div class="msg-role">'+m.role+'</div><div class="msg-body"></div>';
       if(m.role==='assistant'){
@@ -1382,14 +1757,14 @@ function loadConversation(id){
         el.querySelector('.msg-body').textContent = m.text||'';
       }
       if(m.files && m.files.length){
-        const wrapEl=document.createElement('div');wrapEl.className='file-chips';
-        m.files.forEach(f=>{
-          const chip=document.createElement('div');chip.className='fchip';
+        var wrapEl=document.createElement('div');wrapEl.className='file-chips';
+        m.files.forEach(function(f){
+          var chip=document.createElement('div');chip.className='fchip';
           chip.title='click to view files';
           if(f.dataURL&&f.mime&&f.mime.startsWith('image/')){
             chip.innerHTML='<img src="'+f.dataURL+'"><span>'+esc(f.name)+'</span>';
           }else{
-            chip.innerHTML='📄 <span>'+esc(f.name)+'</span>';
+            chip.innerHTML='[file] <span>'+esc(f.name)+'</span>';
           }
           chip.addEventListener('click',openFileModal);
           wrapEl.appendChild(chip);
@@ -1407,23 +1782,21 @@ function loadConversation(id){
 }
 
 function addMessageToConv(role, text, files){
-  const conv = conversations.find(c=>c.id===activeConvId);
+  var conv = conversations.find(function(c){return c.id===activeConvId;});
   if(!conv) return;
-  conv.messages.push({role, text, files:files||[]});
-  // update title from first user message
-  if(role==='user' && conv.messages.filter(m=>m.role==='user').length===1){
+  conv.messages.push({role:role, text:text, files:files||[]});
+  if(role==='user' && conv.messages.filter(function(m){return m.role==='user';}).length===1){
     conv.title = text.slice(0,40)||(files&&files.length?'[file upload]':'New chat');
   }
   conv.updated = Date.now();
-  // move to top
-  const idx = conversations.findIndex(c=>c.id===activeConvId);
-  if(idx>0){ const [c]=conversations.splice(idx,1); conversations.unshift(c); }
+  var idx = conversations.findIndex(function(c){return c.id===activeConvId;});
+  if(idx>0){ var removed=conversations.splice(idx,1); conversations.unshift(removed[0]); }
   saveConversations();
   renderConvList();
 }
 
 function deleteConversation(id){
-  conversations = conversations.filter(c=>c.id!==id);
+  conversations = conversations.filter(function(c){return c.id!==id;});
   saveConversations();
   if(activeConvId===id){
     activeConvId=null;
@@ -1434,26 +1807,26 @@ function deleteConversation(id){
 }
 
 function renderConvList(){
-  const list = document.getElementById('convList');
+  var list = document.getElementById('convList');
   if(conversations.length===0){
     list.innerHTML='<div class="conv-empty">No conversations yet.<br>Start by sending a message.</div>';
     return;
   }
   list.innerHTML='';
-  conversations.forEach(conv=>{
-    const el=document.createElement('div');
+  conversations.forEach(function(conv){
+    var el=document.createElement('div');
     el.className='conv-item'+(conv.id===activeConvId?' active':'');
-    const d=new Date(conv.updated||conv.created);
-    const meta=d.toLocaleDateString(undefined,{month:'short',day:'numeric'});
+    var d=new Date(conv.updated||conv.created);
+    var meta=d.toLocaleDateString(undefined,{month:'short',day:'numeric'});
     el.innerHTML=
       '<div style="flex:1;min-width:0"><div class="conv-item-title">'+esc(conv.title)+'</div>'+
       '<div class="conv-item-meta">'+esc(meta)+' · '+conv.messages.length+' msgs</div></div>'+
-      '<button class="conv-del" data-id="'+conv.id+'" title="Delete">×</button>';
-    el.addEventListener('click',e=>{
+      '<button class="conv-del" data-id="'+conv.id+'" title="Delete">x</button>';
+    el.addEventListener('click',function(e){
       if(e.target.classList.contains('conv-del')) return;
       if(!busy) loadConversation(conv.id);
     });
-    el.querySelector('.conv-del').addEventListener('click',e=>{
+    el.querySelector('.conv-del').addEventListener('click',function(e){
       e.stopPropagation();
       if(confirm('Delete this conversation?')) deleteConversation(conv.id);
     });
@@ -1461,20 +1834,19 @@ function renderConvList(){
   });
 }
 
-// token bar
 function updateTokenBar(show){
-  const bar=document.getElementById('tokenBar');
+  var bar=document.getElementById('tokenBar');
   if(!show){ bar.classList.add('hidden'); return; }
   bar.classList.remove('hidden');
   document.getElementById('tokIn').textContent = tokenStats.in.toLocaleString();
   document.getElementById('tokOut').textContent = tokenStats.out.toLocaleString();
   document.getElementById('tokTurn').textContent = tokenStats.turn;
-  const budgetBar=document.getElementById('budgetBar');
-  const budgetFill=document.getElementById('budgetFill');
-  const budgetTxt=document.getElementById('budgetTxt');
+  var budgetBar=document.getElementById('budgetBar');
+  var budgetFill=document.getElementById('budgetFill');
+  var budgetTxt=document.getElementById('budgetTxt');
   if(tokenBudget>0){
     budgetBar.style.display='block';budgetTxt.style.display='block';
-    const pct=Math.min(100,Math.round(tokenStats.in/tokenBudget*100));
+    var pct=Math.min(100,Math.round(tokenStats.in/tokenBudget*100));
     budgetFill.style.width=pct+'%';
     budgetFill.className='tok-budget-fill'+(pct>90?' over':pct>70?' warn':'');
     budgetTxt.textContent=pct+'% of '+Math.round(tokenBudget/1000)+'k';
@@ -1483,42 +1855,51 @@ function updateTokenBar(show){
   }
 }
 
-// ping 
 async function ping(){
   document.getElementById('pingDot').className='dot pinging';
   try{
-    const r=await fetch('/api/ping');
-    const d=await r.json();
+    var r=await fetch('/api/ping');
+    var d=await r.json();
     document.getElementById('pingDot').className='dot '+(d.ok?'ok':'err');
     document.getElementById('pingMs').textContent=d.ok?d.ms+' ms':'offline';
     if(d.info){
       tokenBudget = d.info.token_budget||0;
+      if(d.info.tools_enabled !== undefined && d.info.tools_enabled !== toolsEnabled){
+        toolsEnabled = d.info.tools_enabled;
+        updateToolsToggleUI();
+      }
+      // sync system prompt from server
+      if(d.info.system_prompt && d.info.system_prompt !== currentSystemPrompt){
+        currentSystemPrompt = d.info.system_prompt;
+        document.getElementById('cfgSystemPrompt').value = currentSystemPrompt;
+      }
       document.getElementById('cfgInfo').innerHTML=
         'provider: '+esc(d.info.provider)+'<br>model: '+esc(d.info.model)+
         '<br>tools: '+d.info.tools+
+        '<br>tools enabled: '+(d.info.tools_enabled?'yes':'no')+
         '<br>max turns: '+d.info.max_turns+
-        '<br>token budget: '+(d.info.token_budget?Math.round(d.info.token_budget/1000)+'k':'unlimited');
+        '<br>token budget: '+(d.info.token_budget?Math.round(d.info.token_budget/1000)+'k':'unlimited')+
+        '<br>config: config.yml';
       document.getElementById('cfgMaxTurns').value=d.info.max_turns;
       document.getElementById('cfgMaxTurnsVal').textContent=d.info.max_turns;
       if(d.info.token_budget) document.getElementById('cfgBudget').value=d.info.token_budget;
       if(!busy) setStatus(d.info.tools+' tools · idle',false);
     }
-  }catch{
+  }catch(e){
     document.getElementById('pingDot').className='dot err';
     document.getElementById('pingMs').textContent='offline';
   }
 }
 ping(); setInterval(ping,10000);
 
-// ── provider / model ──────────────────────────────────────────────────────────
 async function loadModels(){
   try{
-    const r=await fetch('/api/models');
-    const d=await r.json();
-    const sel=document.getElementById('modelSel');
+    var r=await fetch('/api/models');
+    var d=await r.json();
+    var sel=document.getElementById('modelSel');
     sel.innerHTML='';
-    (d.models||[]).forEach(m=>{
-      const o=document.createElement('option');
+    (d.models||[]).forEach(function(m){
+      var o=document.createElement('option');
       o.value=m.id;o.textContent=m.id;
       if(m.id===d.current)o.selected=true;
       sel.appendChild(o);
@@ -1527,11 +1908,11 @@ async function loadModels(){
       document.getElementById('provSel').value=d.provider;
       document.getElementById('cfgProvider').value=d.provider;
     }
-  }catch(e){console.error(e)}
+  }catch(e){console.error(e);}
 }
 
 document.getElementById('provSel').addEventListener('change',async function(){
-  const p=this.value;
+  var p=this.value;
   document.getElementById('cfgProvider').value=p;
   await applyProviderChange(p,'','');
   await loadModels();
@@ -1541,31 +1922,35 @@ document.getElementById('modelSel').addEventListener('change',async function(){
 });
 
 async function applyProviderChange(prov,key,baseUrl){
-  const body={provider:prov,model:providerDefault(prov)};
+  var body={provider:prov,model:providerDefault(prov)};
   if(key)body.api_key=key;
   if(baseUrl)body.base_url=baseUrl;
   await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
 }
 function providerDefault(p){
-  return{gemini:'gemini-2.0-flash',anthropic:'claude-sonnet-4-5',openai:'gpt-4o',
-         openrouter:'anthropic/claude-sonnet-4-5',ollama:'llama3.3'}[p]||'';
+  var m={gemini:'gemini-2.0-flash',anthropic:'claude-sonnet-4-5',openai:'gpt-4o',
+         openrouter:'anthropic/claude-sonnet-4-5',ollama:'llama3.3'};
+  return m[p]||'';
 }
 
-// settings
-document.getElementById('settingsBtn').addEventListener('click',()=>{
-  const p=document.getElementById('settingsPanel');
-  const open=!p.classList.contains('open');
+document.getElementById('settingsBtn').addEventListener('click',function(){
+  var p=document.getElementById('settingsPanel');
+  var open=!p.classList.contains('open');
   p.classList.toggle('open',open);
   document.getElementById('settingsBtn').classList.toggle('active',open);
+  // populate system prompt field when opening
+  if(open){
+    document.getElementById('cfgSystemPrompt').value = currentSystemPrompt;
+  }
 });
 
-document.getElementById('applyConfig').addEventListener('click',async()=>{
-  const prov=document.getElementById('cfgProvider').value;
-  const key=document.getElementById('cfgKey').value.trim();
-  const base=document.getElementById('cfgBase').value.trim();
+document.getElementById('applyConfig').addEventListener('click',async function(){
+  var prov=document.getElementById('cfgProvider').value;
+  var key=document.getElementById('cfgKey').value.trim();
+  var base=document.getElementById('cfgBase').value.trim();
   await applyProviderChange(prov,key,base);
   document.getElementById('provSel').value=prov;
-  addAct('activity',null,'⚙ switched to '+prov,{ts:nowStr()});
+  addAct('activity',null,'switched to '+prov+' · saved to config.yml',{ts:nowStr()});
   await loadModels();
 });
 
@@ -1573,62 +1958,57 @@ document.getElementById('cfgMaxTurns').addEventListener('input',function(){
   document.getElementById('cfgMaxTurnsVal').textContent=this.value;
 });
 
-document.getElementById('applyLimits').addEventListener('click',async()=>{
-  const turns=parseInt(document.getElementById('cfgMaxTurns').value)||12;
-  const budget=parseInt(document.getElementById('cfgBudget').value)||0;
+document.getElementById('applyLimits').addEventListener('click',async function(){
+  var turns=parseInt(document.getElementById('cfgMaxTurns').value)||12;
+  var budget=parseInt(document.getElementById('cfgBudget').value)||0;
   tokenBudget=budget;
-  const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},
+  await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({max_turns:turns,token_budget:budget})});
-  const d=await r.json();
-  addAct('activity',null,'⚡ limits: '+turns+' turns, budget '+(budget?Math.round(budget/1000)+'k':'unlimited'),{ts:nowStr()});
+  addAct('activity',null,'limits: '+turns+' turns, budget '+(budget?Math.round(budget/1000)+'k':'unlimited')+' · saved to config.yml',{ts:nowStr()});
 });
 
-// modules chips
-document.querySelectorAll('.mod-chip').forEach(chip=>{
-  chip.addEventListener('click',()=>{
-    if(chip.dataset.mod==='ai'){chip.classList.remove('on');return;} // ai always blocked
+document.querySelectorAll('.mod-chip').forEach(function(chip){
+  chip.addEventListener('click',function(){
+    if(chip.dataset.mod==='ai'){chip.classList.remove('on');return;}
     chip.classList.toggle('on');
   });
 });
 
-document.getElementById('applyModules').addEventListener('click',async()=>{
-  const active=[...document.querySelectorAll('.mod-chip.on')].map(c=>c.dataset.mod).filter(m=>m!=='ai');
-  // Update server modules setting by sending config (we use a custom endpoint trick)
-  const r=await fetch('/api/refresh-tools',{method:'POST'});
-  const d=await r.json();
-  if(d.error){addAct('aerr',null,'✗ '+d.error,{ts:nowStr()});}
+document.getElementById('applyModules').addEventListener('click',async function(){
+  var r=await fetch('/api/refresh-tools',{method:'POST'});
+  var d=await r.json();
+  if(d.error){addAct('aerr',null,'error: '+d.error,{ts:nowStr()});}
   else{
-    addAct('activity',null,'✓ '+d.tools+' tools loaded',{ts:nowStr()});
+    addAct('activity',null,d.tools+' tools loaded',{ts:nowStr()});
     setStatus(d.tools+' tools · idle',false);
     renderToolsList(d.names||[]);
   }
 });
 
 function renderToolsList(names){
-  const el=document.getElementById('toolsList');
+  var el=document.getElementById('toolsList');
   el.innerHTML='';
-  names.forEach(n=>{
-    const d=document.createElement('div');d.className='tool-item';d.textContent=n;el.appendChild(d);
+  names.forEach(function(n){
+    var d=document.createElement('div');d.className='tool-item';d.textContent=n;el.appendChild(d);
   });
 }
 
-// activity 
-document.getElementById('actToggleBtn').addEventListener('click',()=>{
-  const aside=document.getElementById('aside');
-  const collapsed=aside.classList.toggle('collapsed');
+document.getElementById('actToggleBtn').addEventListener('click',function(){
+  var aside=document.getElementById('aside');
+  var collapsed=aside.classList.toggle('collapsed');
   document.getElementById('actToggleBtn').classList.toggle('active',!collapsed);
 });
-document.getElementById('clearActBtn').addEventListener('click',()=>{
+document.getElementById('clearActBtn').addEventListener('click',function(){
   document.getElementById('actList').innerHTML='';
 });
 
 function addAct(type,label,text,meta){
-  const list=document.getElementById('actList');
-  const el=document.createElement('div');
-  const cls=type==='tool_call'?'tc':type==='tool_result'?'tr':type==='aerr'?'aerr':'';
+  var list=document.getElementById('actList');
+  var el=document.createElement('div');
+  var cls=type==='tool_call'?'tc':type==='tool_result'?'tr':type==='aerr'?'aerr':'';
   el.className='act-item '+cls;
-  const tagCls=type==='tool_call'?'act-tag bold':'act-tag';
-  const txtCls=(text&&(text.startsWith('◌')||text.startsWith('↻')))?'act-txt dim':type==='aerr'?'act-txt err':'act-txt';
+  var tagCls=type==='tool_call'?'act-tag bold':'act-tag';
+  var txtCls=type==='aerr'?'act-txt err':'act-txt';
   el.innerHTML=(label?'<div class="'+tagCls+'">'+esc(label)+'</div>':'')+
     '<div class="'+txtCls+'">'+esc(text||'')+'</div>'+
     (meta?'<div class="act-meta">'+(meta.ts?'<span>'+meta.ts+'</span>':'')+
@@ -1637,116 +2017,111 @@ function addAct(type,label,text,meta){
   list.scrollTop=list.scrollHeight;
 }
 
-// files 
 document.getElementById('filesBtn').addEventListener('click',openFileModal);
-document.getElementById('closeModal').addEventListener('click',()=>document.getElementById('fileModal').classList.remove('open'));
-document.getElementById('fileModal').addEventListener('click',e=>{if(e.target===document.getElementById('fileModal'))document.getElementById('fileModal').classList.remove('open');});
+document.getElementById('closeModal').addEventListener('click',function(){document.getElementById('fileModal').classList.remove('open');});
+document.getElementById('fileModal').addEventListener('click',function(e){if(e.target===document.getElementById('fileModal'))document.getElementById('fileModal').classList.remove('open');});
 
 function openFileModal(){
-  const modal=document.getElementById('fileModal');
-  const body=document.getElementById('modalBody');
+  var modal=document.getElementById('fileModal');
+  var body=document.getElementById('modalBody');
   modal.classList.add('open');
   if(sessionFiles.length===0){body.innerHTML='<div class="modal-empty">no files uploaded yet</div>';return;}
   body.innerHTML='';
-  sessionFiles.forEach((f,i)=>{
-    const entry=document.createElement('div');entry.className='file-entry';
-    const sizeKB=f.size?Math.round(f.size/1024):'?';
-    let prevHTML='';
+  sessionFiles.forEach(function(f,i){
+    var entry=document.createElement('div');entry.className='file-entry';
+    var sizeKB=f.size?Math.round(f.size/1024):'?';
+    var prevHTML='';
     if(f.dataURL&&f.mime&&f.mime.startsWith('image/')){
       prevHTML='<img class="file-entry-preview" src="'+f.dataURL+'">';
     }
     entry.innerHTML='<div class="file-entry-info"><div class="file-entry-name">'+esc(f.name)+'</div>'+
       '<div class="file-entry-meta">'+esc(f.mime||'unknown')+' · '+sizeKB+' KB</div>'+prevHTML+'</div>'+
-      '<div><button class="dl-btn" data-idx="'+f.serverIndex+'">↓ download</button></div>';
+      '<div><button class="dl-btn" data-idx="'+f.serverIndex+'">download</button></div>';
     body.appendChild(entry);
   });
-  body.querySelectorAll('.dl-btn').forEach(btn=>{
-    btn.addEventListener('click',()=>window.open('/api/files/'+btn.dataset.idx,'_blank'));
+  body.querySelectorAll('.dl-btn').forEach(function(btn){
+    btn.addEventListener('click',function(){window.open('/api/files/'+btn.dataset.idx,'_blank');});
   });
 }
 
-document.getElementById('attachBtn').addEventListener('click',()=>document.getElementById('fileInput').click());
+document.getElementById('attachBtn').addEventListener('click',function(){document.getElementById('fileInput').click();});
 document.getElementById('fileInput').addEventListener('change',function(){
-  for(const f of this.files)addAttach(f);this.value='';
+  for(var i=0;i<this.files.length;i++)addAttach(this.files[i]);this.value='';
 });
 function addAttach(file){attachedFiles.push(file);renderPreviews();}
 function renderPreviews(){
-  const wrap=document.getElementById('previews');wrap.innerHTML='';
-  attachedFiles.forEach((f,i)=>{
-    const chip=document.createElement('div');chip.className='prev-chip';
+  var wrap=document.getElementById('previews');wrap.innerHTML='';
+  attachedFiles.forEach(function(f,i){
+    var chip=document.createElement('div');chip.className='prev-chip';
     if(f.type.startsWith('image/')){
-      const url=URL.createObjectURL(f);
-      chip.innerHTML='<img src="'+url+'"><span>'+esc(f.name)+'</span><span class="rm" data-i="'+i+'">×</span>';
+      var url=URL.createObjectURL(f);
+      chip.innerHTML='<img src="'+url+'"><span>'+esc(f.name)+'</span><span class="rm" data-i="'+i+'">x</span>';
     }else{
-      chip.innerHTML='<span>📄</span><span>'+esc(f.name)+'</span><span class="rm" data-i="'+i+'">×</span>';
+      chip.innerHTML='<span>[file]</span><span>'+esc(f.name)+'</span><span class="rm" data-i="'+i+'">x</span>';
     }
     wrap.appendChild(chip);
   });
-  wrap.querySelectorAll('.rm').forEach(btn=>{
-    btn.addEventListener('click',()=>{attachedFiles.splice(+btn.dataset.i,1);renderPreviews();});
+  wrap.querySelectorAll('.rm').forEach(function(btn){
+    btn.addEventListener('click',function(){attachedFiles.splice(+btn.dataset.i,1);renderPreviews();});
   });
 }
 
-const box=document.getElementById('box');
-box.addEventListener('dragover',e=>{e.preventDefault();box.style.borderColor='#000'});
-box.addEventListener('dragleave',()=>{box.style.borderColor=''});
-box.addEventListener('drop',e=>{e.preventDefault();box.style.borderColor='';for(const f of e.dataTransfer.files)addAttach(f)});
+var box=document.getElementById('box');
+box.addEventListener('dragover',function(e){e.preventDefault();box.style.borderColor='#000';});
+box.addEventListener('dragleave',function(){box.style.borderColor='';});
+box.addEventListener('drop',function(e){e.preventDefault();box.style.borderColor='';for(var i=0;i<e.dataTransfer.files.length;i++)addAttach(e.dataTransfer.files[i]);});
 
-// new chat 
-document.getElementById('newChatBtn').addEventListener('click',()=>{
+document.getElementById('newChatBtn').addEventListener('click',function(){
   if(busy)return;
   createNewConversation();
 });
 
-// send 
 async function send(){
   if(busy)return;
-  const prompt=box.value.trim();
+  var prompt=box.value.trim();
   if(!prompt&&attachedFiles.length===0)return;
 
-  // ensure we have an active conversation
-  if(!activeConvId||!conversations.find(c=>c.id===activeConvId)){
+  if(!activeConvId||!conversations.find(function(c){return c.id===activeConvId;})){
     createNewConversation();
-    await new Promise(r=>setTimeout(r,10));
+    await new Promise(function(r){setTimeout(r,10);});
   }
 
   busy=true;box.disabled=true;document.getElementById('sendBtn').disabled=true;
-  const sentFiles=[...attachedFiles];
+  var sentFiles=attachedFiles.slice();
   attachedFiles=[];renderPreviews();
   box.value='';box.style.height='auto';
 
-  // show rate indicator
   document.getElementById('rateDot').className='rate-dot wait';
-  document.getElementById('rateTxt').textContent='waiting…';
+  document.getElementById('rateTxt').textContent='waiting...';
 
-  // read file previews
-  const fileInfos=await Promise.all(sentFiles.map(f=>new Promise(res=>{
-    const fr=new FileReader();
-    fr.onload=()=>res({name:f.name,mime:f.type,size:f.size,dataURL:fr.result,file:f});
-    fr.readAsDataURL(f);
-  })));
+  var fileInfos=await Promise.all(sentFiles.map(function(f){
+    return new Promise(function(res){
+      var fr=new FileReader();
+      fr.onload=function(){res({name:f.name,mime:f.type,size:f.size,dataURL:fr.result,file:f});};
+      fr.readAsDataURL(f);
+    });
+  }));
 
-  const serverIndexStart=sessionFiles.length;
-  fileInfos.forEach((fi,i)=>sessionFiles.push({...fi,serverIndex:serverIndexStart+i}));
+  var serverIndexStart=sessionFiles.length;
+  fileInfos.forEach(function(fi,i){sessionFiles.push(Object.assign({},fi,{serverIndex:serverIndexStart+i}));});
 
-  // add user message to UI
-  const empty=document.getElementById('emptyState');
+  var empty=document.getElementById('emptyState');
   if(empty)empty.remove();
-  const msgs=document.getElementById('msgs');
-  const msgCount=msgs.querySelectorAll('.msg').length;
+  var msgs=document.getElementById('msgs');
+  var msgCount=msgs.querySelectorAll('.msg').length;
   if(msgCount>0){
-    const d=document.createElement('div');d.className='divider';d.innerHTML='<span>· · ·</span>';msgs.appendChild(d);
+    var sep=document.createElement('div');sep.className='divider';sep.innerHTML='<span>· · ·</span>';msgs.appendChild(sep);
   }
-  const userEl=document.createElement('div');
+  var userEl=document.createElement('div');
   userEl.className='msg user';
   userEl.innerHTML='<div class="msg-role">user</div><div class="msg-body"></div>';
   userEl.querySelector('.msg-body').textContent=prompt||(sentFiles.length?'[files]':'');
   if(fileInfos.length){
-    const wrapEl=document.createElement('div');wrapEl.className='file-chips';
-    fileInfos.forEach(fi=>{
-      const chip=document.createElement('div');chip.className='fchip';chip.title='click to view';
+    var wrapEl=document.createElement('div');wrapEl.className='file-chips';
+    fileInfos.forEach(function(fi){
+      var chip=document.createElement('div');chip.className='fchip';chip.title='click to view';
       if(fi.mime&&fi.mime.startsWith('image/'))chip.innerHTML='<img src="'+fi.dataURL+'"><span>'+esc(fi.name)+'</span>';
-      else chip.innerHTML='📄 <span>'+esc(fi.name)+'</span>';
+      else chip.innerHTML='[file] <span>'+esc(fi.name)+'</span>';
       chip.addEventListener('click',openFileModal);
       wrapEl.appendChild(chip);
     });
@@ -1754,13 +2129,12 @@ async function send(){
   }
   msgs.appendChild(userEl);
 
-  addMessageToConv('user',prompt||(sentFiles.length?'[files]':''),fileInfos.map(f=>({name:f.name,mime:f.mime,dataURL:f.dataURL})));
+  addMessageToConv('user',prompt||(sentFiles.length?'[files]':''),fileInfos.map(function(f){return {name:f.name,mime:f.mime,dataURL:f.dataURL};}));
 
   addAct('activity',null,'→ '+(prompt||'file').slice(0,60),{ts:nowStr()});
-  setStatus('thinking…',true);
+  setStatus('thinking...',true);
 
-  // streaming response placeholder
-  const aiEl=document.createElement('div');
+  var aiEl=document.createElement('div');
   aiEl.className='msg assistant thinking';
   aiEl.innerHTML='<div class="msg-role">assistant</div><div class="msg-body"><span class="cursor"></span></div>';
   msgs.appendChild(aiEl);
@@ -1769,31 +2143,32 @@ async function send(){
   tokenStats={in:0,out:0,turn:0};
   updateTokenBar(true);
 
-  const fd=new FormData();
+  var fd=new FormData();
   fd.append('prompt',prompt);
   fd.append('model',document.getElementById('modelSel').value||'');
   fd.append('max_turns',document.getElementById('cfgMaxTurns').value||'12');
-  sentFiles.forEach(f=>fd.append('file',f,f.name));
+  sentFiles.forEach(function(f){fd.append('file',f,f.name);});
 
-  let replyText='';
+  var replyText='';
 
   try{
-    const resp=await fetch('/api/send',{method:'POST',body:fd});
+    var resp=await fetch('/api/send',{method:'POST',body:fd});
     document.getElementById('rateDot').className='rate-dot';
     document.getElementById('rateTxt').textContent='active';
-    const reader=resp.body.getReader();
-    const dec=new TextDecoder();
-    let buf='',evType=null;
+    var reader=resp.body.getReader();
+    var dec=new TextDecoder();
+    var buf='',evType=null;
 
     while(true){
-      const{done,value}=await reader.read();
-      if(done)break;
-      buf+=dec.decode(value,{stream:true});
-      const lines=buf.split('\n');buf=lines.pop();
-      for(const line of lines){
+      var chunk=await reader.read();
+      if(chunk.done)break;
+      buf+=dec.decode(chunk.value,{stream:true});
+      var lines=buf.split('\n');buf=lines.pop();
+      for(var i=0;i<lines.length;i++){
+        var line=lines[i];
         if(line.startsWith('event: ')){evType=line.slice(7).trim();}
         else if(line.startsWith('data: ')&&evType){
-          let d;try{d=JSON.parse(line.slice(6));}catch{evType=null;continue;}
+          var d;try{d=JSON.parse(line.slice(6));}catch(e){evType=null;continue;}
 
           if(evType==='activity'){
             addAct('activity',null,d.text,{ts:d.ts});
@@ -1804,14 +2179,14 @@ async function send(){
             updateTokenBar(true);
           }
           else if(evType==='tool_call'){
-            addAct('tool_call','⚙ '+d.name,d.args,{ts:d.ts});
-            setStatus('⚙ '+d.name+'…',true);
+            addAct('tool_call','tool: '+d.name,d.args,{ts:d.ts});
+            setStatus('tool: '+d.name+'...',true);
           }
           else if(evType==='tool_result'){
-            addAct('tool_result','↩ '+d.name,d.result,{ts:d.ts,ms:d.ms});
+            addAct('tool_result','result: '+d.name,d.result,{ts:d.ts,ms:d.ms});
           }
           else if(evType==='thinking'){
-            addAct('activity',null,'💭 '+String(d).slice(0,80),{ts:nowStr()});
+            addAct('activity',null,'thinking: '+String(d).slice(0,80),{ts:nowStr()});
           }
           else if(evType==='reply'){
             replyText=d;
@@ -1823,7 +2198,7 @@ async function send(){
           else if(evType==='error'){
             aiEl.className='msg assistant';
             aiEl.querySelector('.msg-body').innerHTML='<span style="color:#ef4444">[ error: '+esc(String(d))+' ]</span>';
-            addAct('aerr',null,'✗ '+String(d),{ts:nowStr()});
+            addAct('aerr',null,'error: '+String(d),{ts:nowStr()});
             setStatus('error',false);
             replyText='[error: '+String(d)+']';
           }
@@ -1841,7 +2216,6 @@ async function send(){
     replyText='[connection error]';
   }
 
-  // save assistant reply to conversation
   if(replyText) addMessageToConv('assistant',replyText,[]);
 
   busy=false;box.disabled=false;document.getElementById('sendBtn').disabled=false;
@@ -1851,10 +2225,9 @@ async function send(){
 }
 
 box.addEventListener('input',function(){this.style.height='auto';this.style.height=Math.min(this.scrollHeight,130)+'px';});
-box.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send();}});
+box.addEventListener('keydown',function(e){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send();}});
 document.getElementById('sendBtn').addEventListener('click',send);
 
-// init 
 loadConversations();
 loadModels();
 box.focus();
